@@ -16,6 +16,12 @@ import { sessionChildrenCommand } from "./commands/session-children.js";
 import { sessionCreateCommand } from "./commands/session-create.js";
 import { sessionShareCommand, sessionUnshareCommand } from "./commands/session-share.js";
 import { sessionWaitForTextCommand } from "./commands/session-wait-for-text.js";
+import {
+  worktreeListCommand,
+  worktreeCreateCommand,
+  worktreeRemoveCommand,
+  worktreeRunCommand,
+} from "./commands/worktree.js";
 import { installSkillCommand, viewSkillCommand } from "./commands/skill.js";
 
 const program = new Command();
@@ -52,6 +58,17 @@ session.addCommand(sessionChildrenCommand());
 session.addCommand(sessionShareCommand());
 session.addCommand(sessionUnshareCommand());
 session.addCommand(sessionWaitForTextCommand());
+
+// Worktree subcommand group
+const worktree = program
+  .command("worktree")
+  .alias("wt")
+  .description("Manage git worktrees for parallel session isolation");
+
+worktree.addCommand(worktreeListCommand());
+worktree.addCommand(worktreeCreateCommand());
+worktree.addCommand(worktreeRemoveCommand());
+worktree.addCommand(worktreeRunCommand());
 
 // Skill management (top-level)
 program.addCommand(installSkillCommand());
