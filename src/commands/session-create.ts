@@ -11,16 +11,25 @@ export function sessionCreateCommand(): Command {
       "-p, --parent <id>",
       "Parent session ID (creates a child/sub-agent session)"
     )
+    .option(
+      "-d, --dir <path>",
+      "Project directory for the session (defaults to cwd)"
+    )
     .option("-j, --json", "Output as JSON")
     .option("-q, --quiet", "Only output the session ID")
     .action(async (opts) => {
       const client = await ensureServer();
+
+      const directory = opts.dir
+        ? (await import("path")).resolve(opts.dir)
+        : process.cwd();
 
       const result = await client.session.create({
         body: {
           ...(opts.title && { title: opts.title }),
           ...(opts.parent && { parentID: opts.parent }),
         },
+        query: { directory },
       });
 
       if (!result.data) {

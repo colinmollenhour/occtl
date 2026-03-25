@@ -52,7 +52,7 @@ export OPENCODE_SERVER_PORT=4096
 | Command | Description |
 |---------|-------------|
 | `list` | List sessions (filters by cwd, supports `--all`, path arg, `--sort`, `--asc`) |
-| `create` | Create a new session (`-q` for just the ID, `-t` for title) |
+| `create` | Create a new session (`-q` for ID, `-t` for title, `-d` for directory) |
 | `get` | Get detailed session info |
 | `messages` | List messages (`--role`, `--limit`, `--text-only`, `--verbose`) |
 | `last` | Get the last message (text-only by default) |
@@ -238,6 +238,28 @@ SID=$(occtl create -q -t "ci-fix-$(date +%s)")
 occtl send -w "The CI build failed. Here's the log: $(cat ci-output.log)
 Fix the issues and commit." -s $SID
 ```
+
+### Cross-Project Coordination
+
+Orchestrate work across separate codebases from a single agent:
+
+> "Implement the new /users API in the backend, and simultaneously build the API client in the frontend. When both are done, verify they work together."
+
+```bash
+# Sessions in different projects
+API=$(occtl create -q -d /path/to/backend -t "users API")
+CLIENT=$(occtl create -q -d /path/to/frontend -t "users client")
+
+# Work in parallel
+occtl send --async "implement /users endpoints" -s $API
+occtl send --async "implement users API client" -s $CLIENT
+
+# Wait for both, react to whichever finishes first
+DONE=$(occtl wait-any $API $CLIENT)
+occtl summary $DONE
+```
+
+Works because one OpenCode server manages sessions across directories. Useful for API + client, library + consumers, or monorepo coordination.
 
 ### Session Migration
 

@@ -46,14 +46,17 @@ occtl list --sort title --asc # sort ascending
 ### Create a Session
 
 ```bash
-occtl create                          # create a new session
+occtl create                          # create a new session in the current directory
 occtl create -t "my feature work"     # with a title
+occtl create -d /path/to/project      # create in a specific project directory
 occtl create -q                       # quiet mode: only output the session ID
 occtl create --json                   # full JSON output
 occtl create -p <parent-id>           # create a child session
 ```
 
 The `-q` flag is useful in scripts: `SID=$(occtl create -q)`
+
+The `-d` flag enables cross-project orchestration: `SID=$(occtl create -q -d /path/to/other/project)`
 
 ### Get Session Details
 
@@ -503,11 +506,41 @@ occtl todo ses_xxxxx
 
 **6. Repeat** until `tasks.md` shows all tasks complete.
 
+### Cross-Project Orchestration
+
+You can coordinate work across completely separate codebases. Use `--dir`
+when creating sessions to target different project directories:
+
+```bash
+# Create sessions in different projects
+API_SID=$(occtl create -q -d /path/to/backend -t "implement API endpoints")
+CLIENT_SID=$(occtl create -q -d /path/to/frontend -t "implement API client")
+
+# Send prompts to both
+occtl send --async "Add the /users REST endpoints per the spec in docs/api.md" -s $API_SID
+occtl send --async "Add API client methods for the /users endpoints" -s $CLIENT_SID
+
+# Wait for both, checking whichever finishes first
+DONE=$(occtl wait-any $API_SID $CLIENT_SID)
+occtl summary $DONE
+# ... continue coordinating
+```
+
+This works because one OpenCode server can manage sessions across different
+directories. Each session operates in its own project context.
+
+Use cases:
+- **API + client**: Implement a backend API and its frontend client simultaneously
+- **Library + consumers**: Make a library change and update all downstream repos
+- **Monorepo coordination**: Work across packages that have separate contexts
+- **Migration**: Change a shared schema in one project and update all dependents
+
 ### Key Commands for Orchestration
 
 | What you need to do | Command |
 |---|---|
 | Create a fresh session | `occtl create -q -t "ralph-N"` |
+| Create session in another project | `occtl create -q -d /path/to/project` |
 | Send prompt to a session | `occtl send --async "prompt text" -s <id>` |
 | Auto-approve permissions | `occtl respond <id> --auto-approve --wait` |
 | Wait for session to finish | `occtl wait-for-idle <id> --timeout 600` |
