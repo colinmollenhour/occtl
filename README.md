@@ -7,7 +7,7 @@ Built for automating and orchestrating OpenCode sessions externally -- including
 ## Install
 
 ```bash
-npm install -g occtl
+npm install -g @colinmollenhour/occtl
 ```
 
 ## Quick Start
