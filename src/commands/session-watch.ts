@@ -25,7 +25,7 @@ export function sessionWatchCommand(): Command {
       console.error(`Watching session ${resolved}...`);
       console.error("Press Ctrl+C to stop.\n");
 
-      await streamEvents(resolved, (event) => {
+      const result = await streamEvents(resolved, (event) => {
         if (filterTypes && !filterTypes.includes(event.type)) return;
 
         if (opts.json) {
@@ -40,6 +40,11 @@ export function sessionWatchCommand(): Command {
 
         handleEvent(event);
       });
+
+      if (result === "disconnected") {
+        console.error("\nConnection lost.");
+        process.exit(1);
+      }
     });
 }
 

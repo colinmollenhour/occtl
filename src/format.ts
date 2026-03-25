@@ -5,7 +5,7 @@ export function formatTime(ts: number): string {
 }
 
 export function formatTimeAgo(ts: number): string {
-  const diff = Date.now() - ts;
+  const diff = Math.max(0, Date.now() - ts);
   const seconds = Math.floor(diff / 1000);
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
@@ -72,11 +72,11 @@ export function extractToolCalls(parts: Part[]): Array<{
   return parts
     .filter((p) => p.type === "tool")
     .map((p) => {
-      const toolPart = p as { tool: string; state: { status: string; title?: string } };
+      const toolPart = p as { tool: string; state?: { status: string; title?: string } };
       return {
         tool: toolPart.tool,
-        status: toolPart.state.status,
-        title: toolPart.state.title,
+        status: toolPart.state?.status ?? "unknown",
+        title: toolPart.state?.title,
       };
     });
 }

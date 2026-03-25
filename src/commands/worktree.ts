@@ -1,10 +1,11 @@
 import { Command } from "commander";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { existsSync } from "fs";
 import { resolve, basename } from "path";
 import { ensureServer } from "../client.js";
-import { formatJSON } from "../format.js";
-import { streamEvents } from "../sse.js";
+import { formatJSON, formatMessage } from "../format.js";
+import { startStream } from "../sse.js";
+import { waitForIdle } from "../wait-util.js";
 
 interface Worktree {
   path: string;
@@ -15,7 +16,7 @@ interface Worktree {
 
 function getRepoRoot(): string {
   try {
-    return execSync("git rev-parse --show-toplevel", {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
       encoding: "utf-8",
       timeout: 5000,
     }).trim();
@@ -27,7 +28,7 @@ function getRepoRoot(): string {
 
 function parseWorktreeList(): Worktree[] {
   try {
-    const output = execSync("git worktree list --porcelain", {
+    const output = execFileSync("git", ["worktree", "list", "--porcelain"], {
       encoding: "utf-8",
       timeout: 5000,
     });
@@ -61,6 +62,37 @@ function parseWorktreeList(): Worktree[] {
 function getWorktreeDir(): string {
   const root = getRepoRoot();
   return resolve(root, ".occtl", "worktrees");
+}
+
+/**
+ * Create a git worktree. Uses execFileSync (no shell) to prevent injection.
+ */
+function createWorktree(wtPath: string, branch: string, base: string): void {
+  try {
+    execFileSync("git", ["worktree", "add", wtPath, "-b", branch, base], {
+      encoding: "utf-8",
+      stdio: "pipe",
+      timeout: 30000,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("already exists")) {
+      try {
+        execFileSync("git", ["worktree", "add", wtPath, branch], {
+          encoding: "utf-8",
+          stdio: "pipe",
+          timeout: 30000,
+        });
+      } catch (err2: unknown) {
+        const msg2 = err2 instanceof Error ? err2.message : String(err2);
+        console.error(`Failed to create worktree: ${msg2}`);
+        process.exit(1);
+      }
+    } else {
+      console.error(`Failed to create worktree: ${msg}`);
+      process.exit(1);
+    }
+  }
 }
 
 // ─── list ──────────────────────────────────────────────
@@ -125,31 +157,7 @@ export function worktreeCreateCommand(): Command {
         process.exit(1);
       }
 
-      try {
-        execSync(
-          `git worktree add "${wtPath}" -b "${branch}" ${base}`,
-          { encoding: "utf-8", stdio: "pipe", timeout: 30000 }
-        );
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        // If the branch already exists, try checking it out instead
-        if (msg.includes("already exists")) {
-          try {
-            execSync(`git worktree add "${wtPath}" "${branch}"`, {
-              encoding: "utf-8",
-              stdio: "pipe",
-              timeout: 30000,
-            });
-          } catch (err2: unknown) {
-            const msg2 = err2 instanceof Error ? err2.message : String(err2);
-            console.error(`Failed to create worktree: ${msg2}`);
-            process.exit(1);
-          }
-        } else {
-          console.error(`Failed to create worktree: ${msg}`);
-          process.exit(1);
-        }
-      }
+      createWorktree(wtPath, branch, base);
 
       const result: Record<string, unknown> = {
         path: wtPath,
@@ -200,7 +208,6 @@ export function worktreeRemoveCommand(): Command {
     .argument("<name>", "Worktree name or path")
     .option("-f, --force", "Force removal even if dirty")
     .action(async (name: string, opts) => {
-      // Resolve: could be a name under .occtl/worktrees/ or a full path
       let wtPath: string;
       const candidate = resolve(getWorktreeDir(), name);
       if (existsSync(candidate)) {
@@ -208,7 +215,6 @@ export function worktreeRemoveCommand(): Command {
       } else if (existsSync(name)) {
         wtPath = resolve(name);
       } else {
-        // Try matching by name in the worktree list
         const worktrees = parseWorktreeList();
         const match = worktrees.find(
           (wt) =>
@@ -222,9 +228,11 @@ export function worktreeRemoveCommand(): Command {
         }
       }
 
-      const forceFlag = opts.force ? " --force" : "";
+      const args = ["worktree", "remove", wtPath];
+      if (opts.force) args.push("--force");
+
       try {
-        execSync(`git worktree remove "${wtPath}"${forceFlag}`, {
+        execFileSync("git", args, {
           encoding: "utf-8",
           stdio: "pipe",
           timeout: 30000,
@@ -272,30 +280,7 @@ export function worktreeRunCommand(): Command {
       const base = opts.base || "HEAD";
 
       if (!existsSync(wtPath)) {
-        try {
-          execSync(
-            `git worktree add "${wtPath}" -b "${branch}" ${base}`,
-            { encoding: "utf-8", stdio: "pipe", timeout: 30000 }
-          );
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("already exists")) {
-            try {
-              execSync(`git worktree add "${wtPath}" "${branch}"`, {
-                encoding: "utf-8",
-                stdio: "pipe",
-                timeout: 30000,
-              });
-            } catch (err2: unknown) {
-              const msg2 = err2 instanceof Error ? err2.message : String(err2);
-              console.error(`Failed to create worktree: ${msg2}`);
-              process.exit(1);
-            }
-          } else {
-            console.error(`Failed to create worktree: ${msg}`);
-            process.exit(1);
-          }
-        }
+        createWorktree(wtPath, branch, base);
         console.error(`Created worktree: ${wtPath} (branch: ${branch})`);
       } else {
         console.error(`Using existing worktree: ${wtPath}`);
@@ -342,29 +327,29 @@ export function worktreeRunCommand(): Command {
         ...(opts.agent && { agent: opts.agent }),
       };
 
-      // Start auto-approve in background if requested
-      let approveCleanup: (() => void) | undefined;
+      // Start auto-approve in background if requested.
+      // Uses startStream which returns a cancel handle.
+      let approveHandle: ReturnType<typeof startStream> | undefined;
       if (opts.autoApprove) {
-        const controller = new AbortController();
-        // Fire-and-forget the auto-approve stream
-        streamEvents(sid, async (event) => {
-          if (event.type === "permission.updated") {
-            const props = event.properties as {
-              id: string;
-              sessionID: string;
-            };
-            try {
-              await client.postSessionIdPermissionsPermissionId({
-                path: { id: sid, permissionID: props.id },
-                body: { response: "once" },
-              });
-              console.error(`Auto-approved: ${props.id}`);
-            } catch {
-              // ignore
-            }
+        approveHandle = startStream(sid, async (event) => {
+          if (event.type !== "permission.updated") return;
+          const props = event.properties as {
+            id: string;
+            status?: string;
+          };
+          if (props.status && props.status !== "pending") return;
+          try {
+            await client.postSessionIdPermissionsPermissionId({
+              path: { id: sid, permissionID: props.id },
+              body: { response: "once" },
+            });
+            console.error(`Auto-approved: ${props.id}`);
+          } catch (err) {
+            console.error(
+              `Failed to auto-approve ${props.id}: ${err instanceof Error ? err.message : String(err)}`
+            );
           }
-        }).catch(() => {});
-        approveCleanup = () => controller.abort();
+        });
       }
 
       // Send the prompt
@@ -375,31 +360,34 @@ export function worktreeRunCommand(): Command {
       console.error("Prompt sent.");
 
       if (!opts.wait) {
-        // Output session info and exit
         const output = { sessionID: sid, worktree: wtPath, branch };
         if (opts.json) {
           console.log(formatJSON(output));
         } else {
           console.log(`Session ${sid} started in ${wtPath}`);
-          console.log("Use 'occtl s watch' or 'occtl s wait-for-text' to monitor.");
+          if (approveHandle) {
+            console.log("Auto-approve is active. Press Ctrl+C to stop.");
+            // Keep running — the auto-approve stream keeps the event loop alive
+            return;
+          }
         }
-        // Give auto-approve a moment, then exit
-        if (approveCleanup) {
-          // Don't await — let it run in background
-          setTimeout(() => process.exit(0), 500);
-          return;
-        }
+        // Clean up auto-approve if not keeping it running
+        approveHandle?.cancel();
         return;
       }
 
-      // --wait: block until idle
-      await streamEvents(sid, (event) => {
-        if (event.type === "session.idle") {
-          return "stop";
-        }
-      });
+      // --wait: use race-safe waitForIdle
+      const waitResult = await waitForIdle(client, sid);
 
-      approveCleanup?.();
+      // Clean up auto-approve
+      approveHandle?.cancel();
+
+      if (!waitResult.idle) {
+        if (waitResult.reason === "disconnected") {
+          console.error("Error: lost connection to OpenCode server.");
+        }
+        process.exit(1);
+      }
 
       // Fetch the last assistant message
       const msgs = await client.session.messages({
@@ -425,7 +413,6 @@ export function worktreeRunCommand(): Command {
         return;
       }
 
-      const { formatMessage } = await import("../format.js");
       const textOnly = opts.textOnly !== false;
       console.log(formatMessage(last.info, last.parts, { textOnly }));
     });

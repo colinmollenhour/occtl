@@ -3,7 +3,7 @@ import { ensureServer, getClient } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import { formatJSON } from "../format.js";
 import { streamEvents } from "../sse.js";
-import type { Permission } from "@opencode-ai/sdk";
+import type { StreamResult } from "../sse.js";
 
 export function sessionRespondCommand(): Command {
   return new Command("respond")
@@ -22,7 +22,7 @@ export function sessionRespondCommand(): Command {
     .option("-w, --wait", "Wait for a permission request if none pending")
     .option(
       "--auto-approve",
-      "Automatically approve all permission requests (use with --wait)"
+      "Automatically approve all permission requests (implies --wait)"
     )
     .action(async (sessionId: string | undefined, opts) => {
       const client = await ensureServer();
@@ -79,27 +79,46 @@ async function waitAndRespond(
   console.error(`Waiting for permission requests on session ${sessionId}...`);
   console.error("Press Ctrl+C to stop.\n");
 
-  await streamEvents(sessionId, async (event) => {
+  const result: StreamResult = await streamEvents(sessionId, async (event) => {
     if (event.type !== "permission.updated") return;
 
-    const permission = event.properties as Permission;
+    const props = event.properties as {
+      id: string;
+      title: string;
+      type: string;
+      status?: string;
+      sessionID?: string;
+    };
+
+    // Skip permissions that are not pending (already resolved)
+    if (props.status && props.status !== "pending") return;
 
     console.error(
-      `Permission request: ${permission.title} (type: ${permission.type}, id: ${permission.id})`
+      `Permission request: ${props.title} (type: ${props.type}, id: ${props.id})`
     );
 
-    if (opts.autoApprove) {
-      await respondToPermission(sessionId, permission.id, "once");
-      console.error(`Auto-approved: ${permission.id}`);
-    } else {
-      await respondToPermission(
-        sessionId,
-        permission.id,
-        opts.response as "once" | "always" | "reject"
+    try {
+      if (opts.autoApprove) {
+        await respondToPermission(sessionId, props.id, "once");
+        console.error(`Auto-approved: ${props.id}`);
+      } else {
+        await respondToPermission(
+          sessionId,
+          props.id,
+          opts.response as "once" | "always" | "reject"
+        );
+        console.error(`Responded with "${opts.response}": ${props.id}`);
+        return "stop";
+      }
+    } catch (err) {
+      console.error(
+        `Failed to respond to ${props.id}: ${err instanceof Error ? err.message : String(err)}`
       );
-      console.error(`Responded with "${opts.response}": ${permission.id}`);
-      // After responding once, stop unless auto-approve
-      return "stop";
     }
   });
+
+  if (result === "disconnected") {
+    console.error("Error: lost connection to OpenCode server.");
+    process.exit(1);
+  }
 }

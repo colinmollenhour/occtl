@@ -1,8 +1,8 @@
 import { Command } from "commander";
 import { ensureServer } from "../client.js";
-import { formatMessage, formatJSON, extractText } from "../format.js";
+import { formatMessage, formatJSON } from "../format.js";
 import { resolveSession } from "../resolve.js";
-import { streamEvents } from "../sse.js";
+import { waitForIdle } from "../wait-util.js";
 
 export function sessionSendCommand(): Command {
   return new Command("send")
@@ -75,12 +75,14 @@ export function sessionSendCommand(): Command {
           body,
         });
 
-        // Block until the session goes idle
-        await streamEvents(resolved, (event) => {
-          if (event.type === "session.idle") {
-            return "stop";
+        const result = await waitForIdle(client, resolved);
+
+        if (!result.idle) {
+          if (result.reason === "disconnected") {
+            console.error("Error: lost connection to OpenCode server.");
           }
-        });
+          process.exit(1);
+        }
 
         // Fetch and display the last assistant message
         const msgs = await client.session.messages({
@@ -109,23 +111,23 @@ export function sessionSendCommand(): Command {
       }
 
       // Default: synchronous send (blocks until response)
-      const result = await client.session.prompt({
+      const syncResult = await client.session.prompt({
         path: { id: resolved },
         body,
       });
 
-      if (!result.data) {
+      if (!syncResult.data) {
         console.error("No response received.");
         process.exit(1);
       }
 
       if (opts.json) {
-        console.log(formatJSON(result.data));
+        console.log(formatJSON(syncResult.data));
         return;
       }
 
       console.log(
-        formatMessage(result.data.info, result.data.parts, {
+        formatMessage(syncResult.data.info, syncResult.data.parts, {
           verbose: opts.verbose,
           textOnly: opts.textOnly ?? true,
         })

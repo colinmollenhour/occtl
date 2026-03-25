@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { ensureServer } from "../client.js";
 import { resolveSession } from "../resolve.js";
-import { streamEvents, streamAllEvents, getEventSessionId } from "../sse.js";
+import { waitForIdle, waitForAnyIdle } from "../wait-util.js";
 import { formatJSON } from "../format.js";
 
 // ─── wait-for-idle ─────────────────────────────────────
@@ -21,43 +21,19 @@ export function sessionWaitForIdleCommand(): Command {
       const client = await ensureServer();
       const resolved = await resolveSession(client, sessionId);
 
-      // Set up timeout
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      if (opts.timeout && opts.timeout > 0) {
-        timer = setTimeout(() => process.exit(1), opts.timeout * 1000);
-      }
+      const timeoutMs = opts.timeout ? opts.timeout * 1000 : undefined;
+      const result = await waitForIdle(client, resolved, timeoutMs);
 
-      // To avoid a race between the status check and SSE connection,
-      // we start listening on SSE first, then check current status.
-      // If the session went idle before our SSE connected, we catch it
-      // in the status check. If it goes idle after, the SSE stream
-      // catches it. No gap.
-      let resolved_via_api = false;
-
-      const streamPromise = streamEvents(resolved, (event) => {
-        if (event.type === "session.idle") {
-          if (timer) clearTimeout(timer);
-          return "stop";
-        }
-      });
-
-      // Give the SSE connection a moment to establish, then check status
-      await new Promise((r) => setTimeout(r, 50));
-
-      const statusResult = await client.session.status();
-      const statuses = statusResult.data ?? {};
-      const current = statuses[resolved];
-      if (!current || current.type === "idle") {
-        resolved_via_api = true;
-        if (timer) clearTimeout(timer);
+      if (result.idle) {
         process.exit(0);
       }
 
-      if (!resolved_via_api) {
-        await streamPromise;
+      if (result.reason === "timeout") {
+        console.error("Timeout: session did not go idle in time.");
+      } else if (result.reason === "disconnected") {
+        console.error("Error: lost connection to OpenCode server.");
       }
-
-      process.exit(0);
+      process.exit(1);
     });
 }
 
@@ -86,53 +62,25 @@ export function sessionWaitAnyCommand(): Command {
       for (const sid of sessionIds) {
         resolved.push(await resolveSession(client, sid));
       }
-      const watchSet = new Set(resolved);
 
-      // Set up timeout
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      if (opts.timeout && opts.timeout > 0) {
-        timer = setTimeout(() => process.exit(1), opts.timeout * 1000);
-      }
+      const timeoutMs = opts.timeout ? opts.timeout * 1000 : undefined;
+      const result = await waitForAnyIdle(client, resolved, timeoutMs);
 
-      const outputAndExit = (sid: string, reason: string) => {
-        if (timer) clearTimeout(timer);
+      if (result.sessionID) {
         if (opts.json) {
-          console.log(formatJSON({ sessionID: sid, reason }));
+          console.log(formatJSON({ sessionID: result.sessionID, reason: result.reason }));
         } else {
-          console.log(sid);
+          console.log(result.sessionID);
         }
         process.exit(0);
-      };
-
-      // Start SSE first, then check status — avoids race condition
-      let resolved_via_api = false;
-
-      const streamPromise = streamAllEvents((event) => {
-        if (event.type !== "session.idle") return;
-
-        const eventSid = getEventSessionId(event);
-        if (!eventSid || !watchSet.has(eventSid)) return;
-
-        outputAndExit(eventSid, "idle");
-        return "stop";
-      });
-
-      // Give SSE a moment to connect, then check current status
-      await new Promise((r) => setTimeout(r, 50));
-
-      const statusResult = await client.session.status();
-      const statuses = statusResult.data ?? {};
-      for (const sid of resolved) {
-        const current = statuses[sid];
-        if (!current || current.type === "idle") {
-          resolved_via_api = true;
-          outputAndExit(sid, "already_idle");
-        }
       }
 
-      if (!resolved_via_api) {
-        await streamPromise;
+      if (result.reason === "timeout") {
+        console.error("Timeout: no session went idle in time.");
+      } else if (result.reason === "disconnected") {
+        console.error("Error: lost connection to OpenCode server.");
       }
+      process.exit(1);
     });
 }
 
