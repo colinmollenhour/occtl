@@ -17,6 +17,12 @@ import { sessionCreateCommand } from "./commands/session-create.js";
 import { sessionShareCommand, sessionUnshareCommand } from "./commands/session-share.js";
 import { sessionWaitForTextCommand } from "./commands/session-wait-for-text.js";
 import {
+  sessionWaitForIdleCommand,
+  sessionWaitAnyCommand,
+  sessionIsIdleCommand,
+} from "./commands/session-wait.js";
+import { sessionSummaryCommand } from "./commands/session-summary.js";
+import {
   worktreeListCommand,
   worktreeCreateCommand,
   worktreeRemoveCommand,
@@ -58,6 +64,10 @@ session.addCommand(sessionChildrenCommand());
 session.addCommand(sessionShareCommand());
 session.addCommand(sessionUnshareCommand());
 session.addCommand(sessionWaitForTextCommand());
+session.addCommand(sessionWaitForIdleCommand());
+session.addCommand(sessionWaitAnyCommand());
+session.addCommand(sessionIsIdleCommand());
+session.addCommand(sessionSummaryCommand());
 
 // Worktree subcommand group
 const worktree = program

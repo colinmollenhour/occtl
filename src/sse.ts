@@ -2,25 +2,45 @@ import type { Event } from "@opencode-ai/sdk";
 import { getBaseUrl } from "./client.js";
 
 /**
+ * Extract the session ID from an event, checking all known locations.
+ */
+export function getEventSessionId(event: Event): string | undefined {
+  const props = event.properties as Record<string, unknown>;
+  return (
+    (props.sessionID as string) ||
+    ((props.info as Record<string, unknown>)?.sessionID as string) ||
+    ((props.info as Record<string, unknown>)?.id as string) ||
+    ((props.part as Record<string, unknown>)?.sessionID as string) ||
+    undefined
+  );
+}
+
+/**
  * Check if an SSE event belongs to a given session.
  */
 export function isSessionEvent(event: Event, sessionId: string): boolean {
-  const props = event.properties as Record<string, unknown>;
-
-  if (props.sessionID === sessionId) return true;
-  if ((props.info as Record<string, unknown>)?.sessionID === sessionId) return true;
-  if ((props.info as Record<string, unknown>)?.id === sessionId) return true;
-  if ((props.part as Record<string, unknown>)?.sessionID === sessionId) return true;
-
-  return false;
+  return getEventSessionId(event) === sessionId;
 }
 
 /**
  * Connect to the OpenCode SSE event stream and invoke a callback for each
- * parsed event. Returns the reader so callers can cancel it.
+ * parsed event that matches the given session.
  */
 export async function streamEvents(
   sessionId: string,
+  onEvent: (event: Event) => void | "stop" | Promise<void | "stop">
+): Promise<void> {
+  await streamAllEvents((event) => {
+    if (!isSessionEvent(event, sessionId)) return;
+    return onEvent(event);
+  });
+}
+
+/**
+ * Connect to the SSE stream and invoke callback for ALL events (unfiltered).
+ * Callback can return "stop" to close the stream.
+ */
+export async function streamAllEvents(
   onEvent: (event: Event) => void | "stop" | Promise<void | "stop">
 ): Promise<void> {
   const url = `${getBaseUrl()}/event`;
@@ -54,8 +74,6 @@ export async function streamEvents(
 
         try {
           const event = JSON.parse(data) as Event;
-          if (!isSessionEvent(event, sessionId)) continue;
-
           const result = await onEvent(event);
           if (result === "stop") {
             reader.cancel();

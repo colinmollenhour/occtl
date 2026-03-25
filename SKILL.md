@@ -197,6 +197,47 @@ occtl s wait-for-text "DONE" --check-existing        # also check existing messa
 
 Silently watches the SSE stream until a message contains the given text, then outputs everything after that text and exits 0. Exits 1 on timeout. Useful for automation scripts that need to block until the agent signals completion.
 
+### Wait for Idle
+
+```bash
+occtl s wait-for-idle                     # block until most recent session is idle
+occtl s wait-for-idle <session-id>        # block until specific session is idle
+occtl s wait-for-idle --timeout 300       # timeout after 5 minutes (exit 1)
+```
+
+Blocks until the session goes idle. Does a quick status check first — if already idle, exits immediately. Otherwise watches the SSE stream. Exit 0 = idle, exit 1 = timeout.
+
+### Wait Any (Multiple Sessions)
+
+```bash
+occtl s wait-any <id1> <id2> <id3>        # wait for FIRST to go idle, output its ID
+occtl s wait-any <id1> <id2> --timeout 600
+occtl s wait-any <id1> <id2> --json       # {"sessionID": "...", "reason": "idle"}
+```
+
+Watches multiple sessions simultaneously. Outputs the session ID of the first one to go idle and exits. Essential for orchestrating parallel workloads.
+
+### Is Idle (Non-Blocking Check)
+
+```bash
+occtl s is-idle                           # exit 0 if idle, exit 1 if busy
+occtl s is-idle <session-id>
+occtl s is-idle --json                    # {"sessionID": "...", "idle": true, "status": "idle"}
+```
+
+Non-blocking check. Useful for conditional logic in agent orchestration.
+
+### Session Summary
+
+```bash
+occtl s summary                           # compact summary of most recent session
+occtl s summary <session-id>
+occtl s summary --json                    # machine-readable summary
+occtl s summary -n 500                    # longer last-message snippet (default: 200 chars)
+```
+
+Shows status, todo progress, total cost, file changes, and a snippet of the last assistant message — all in one call. Designed for orchestration agents that need a quick overview without reading full message history.
+
 ### Share / Unshare
 
 ```bash
@@ -389,181 +430,201 @@ occtl s watch --text-only
 
 All commands support `--json` for machine-readable output. The JSON structure matches the OpenCode SDK types directly (`Session`, `Message`, `Part`, `Todo`, etc.).
 
-## Creating a Ralph Loop
+## Ralph Mode
 
-The Ralph Loop (aka "Ralph Wiggum pattern") is an autonomous coding technique where an AI agent works through a task list in a loop, with fresh context each iteration. Progress persists via the filesystem and git — not the context window. Each iteration: the agent reads the current state, picks a task, implements it, verifies it, commits, and marks it done. The loop repeats until all tasks pass or a max iteration count is reached.
+Ralph Mode turns YOU (the agent reading this skill) into an autonomous project
+orchestrator. Instead of a bash script driving the loop, you ARE the loop. You
+create sessions, send prompts, monitor progress, handle failures, and keep
+iterating until the project is done — all by running `occtl` commands.
 
-`occtl` makes this pattern smarter than a raw bash loop because you can inspect the agent's actual output, watch its progress in real-time, auto-approve permissions, and use `wait-for-text` to detect completion signals reliably.
+The user kicks it off with something like:
+> "Use the occtl skill to complete project X using Ralph Mode."
 
-### Prerequisites
+And you take it from there.
 
-1. A running OpenCode instance (`opencode serve`)
-2. A task file in your project (e.g. `tasks.md`, `prd.json`, or similar)
-3. A prompt file that tells the agent how to work (e.g. `PROMPT.md`)
+### How It Works
 
-### Minimal Ralph Loop
+The Ralph pattern: break work into atomic tasks, execute each in a fresh session
+(fresh context window), persist progress in the filesystem, repeat until done.
 
-The simplest version — a fresh session per iteration, just like the original Ralph:
+You are smarter than a bash loop because you can:
+- Read the worker session's output and decide what to do next
+- Adjust the prompt based on what actually happened
+- Run multiple sessions in parallel on independent tasks
+- Use worktrees to isolate parallel work that would conflict
+- Handle errors, retries, and stuck sessions intelligently
+- Make strategic decisions about task ordering and dependencies
 
-```bash
-#!/usr/bin/env bash
-set -e
+### Step-by-Step Procedure
 
-MAX_ITERATIONS=${1:-10}
-PROMPT_FILE="./PROMPT.md"
+When asked to use Ralph Mode, follow this procedure:
 
-for i in $(seq 1 "$MAX_ITERATIONS"); do
-  echo "=== Ralph iteration $i/$MAX_ITERATIONS ==="
+**1. Assess the project.** Read the codebase, requirements, and any existing
+task files. Understand what needs to be done.
 
-  # Fresh session each iteration (the core Ralph principle)
-  SID=$(occtl s create -q -t "ralph-$i")
+**2. Create a task list.** Write a `tasks.md` file (or similar) in the project
+root. Each task should be:
+- Atomic: completable in a single session/context window
+- Verifiable: has clear done criteria (tests pass, file exists, etc.)
+- Independent: minimizes dependencies on other tasks
 
-  # Send prompt async to the new session
-  occtl s send --async "$(cat "$PROMPT_FILE")" -s "$SID"
+**3. Create a `PROMPT.md` file.** This is the base prompt sent to each worker
+session. It should tell the worker to:
+- Read `tasks.md` and `progress.txt` to understand current state
+- Pick one incomplete task and implement it
+- Run tests/verification before marking done
+- Update `tasks.md` (mark task done) and `progress.txt` (append summary)
+- Commit changes
 
-  # Auto-approve permissions in background
-  occtl s respond "$SID" --auto-approve --wait &
-  APPROVE_PID=$!
-
-  # Wait for the agent to signal completion
-  if occtl s wait-for-text "RALPH_COMPLETE" "$SID" --timeout 600; then
-    kill $APPROVE_PID 2>/dev/null || true
-    echo "=== Iteration $i complete ==="
-  else
-    kill $APPROVE_PID 2>/dev/null || true
-    echo "=== Iteration $i timed out ==="
-  fi
-
-  # Check if all tasks are done
-  if occtl s wait-for-text "ALL_TASKS_DONE" "$SID" \
-       --check-existing --timeout 1; then
-    echo "=== All tasks complete! ==="
-    break
-  fi
-done
-```
-
-### Smarter Ralph Loop with occtl
-
-This version creates a fresh session each iteration and uses `occtl` to inspect what the agent actually did between iterations — giving you observability and control that a raw bash loop cannot:
+**4. Execute the loop.** For each iteration:
 
 ```bash
-#!/usr/bin/env bash
-set -e
+# Create a fresh session
+occtl s create -q -t "ralph-iteration-N"
+# Returns: ses_xxxxx
 
-MAX_ITERATIONS=${1:-10}
-PROMPT_FILE="./PROMPT.md"
-PROGRESS_FILE="./progress.txt"
-TASK_FILE="./tasks.md"
+# Send the prompt (async so you don't block)
+occtl s send --async "$(cat PROMPT.md)" -s ses_xxxxx
 
-for i in $(seq 1 "$MAX_ITERATIONS"); do
-  echo "=== Ralph iteration $i/$MAX_ITERATIONS ==="
+# Auto-approve permissions for this session
+occtl s respond ses_xxxxx --auto-approve --wait
+# (this runs in background via the shell — use & in bash)
 
-  # Fresh session each iteration — avoids context rot
-  SID=$(occtl s create -q -t "ralph-$i")
-  echo "Session: $SID"
+# Wait for the session to finish
+occtl s wait-for-idle ses_xxxxx --timeout 600
 
-  # Build the prompt with progress context
-  PROMPT="$(cat "$PROMPT_FILE")
-
-## Current Progress
-$(cat "$PROGRESS_FILE" 2>/dev/null || echo 'No progress yet.')
-
-## Task List
-$(cat "$TASK_FILE")
-
-When you are done with this iteration, output RALPH_DONE on its own line.
-If ALL tasks are complete, output ALL_TASKS_COMPLETE on its own line."
-
-  # Send async so we can monitor in parallel
-  occtl s send --async "$PROMPT" -s "$SID"
-
-  # Auto-approve permissions in background
-  occtl s respond "$SID" --auto-approve --wait &
-  APPROVE_PID=$!
-
-  # Wait for the agent to signal completion
-  occtl s wait-for-text "RALPH_DONE" "$SID" --timeout 600
-  EXIT_CODE=$?
-
-  kill $APPROVE_PID 2>/dev/null || true
-  wait $APPROVE_PID 2>/dev/null || true
-
-  if [ $EXIT_CODE -ne 0 ]; then
-    echo "=== Iteration $i timed out or failed ==="
-    # Capture what happened for debugging
-    occtl s last "$SID" >> "$PROGRESS_FILE"
-    continue
-  fi
-
-  # Append the agent's summary to progress file
-  occtl s last "$SID" >> "$PROGRESS_FILE"
-
-  # Check the todo list for remaining work
-  echo "--- Todos after iteration $i ---"
-  occtl s todo "$SID"
-
-  # Show what files changed this iteration
-  echo "--- Diff ---"
-  occtl s diff "$SID"
-
-  # Check if the agent signalled full completion
-  if occtl s wait-for-text "ALL_TASKS_COMPLETE" "$SID" \
-       --check-existing --timeout 1; then
-    echo "=== All tasks complete after $i iterations ==="
-    break
-  fi
-
-  echo "--- Continuing to next iteration ---"
-  echo ""
-done
-
-echo "=== Ralph Loop finished ==="
+# Check what happened
+occtl s summary ses_xxxxx
+occtl s last ses_xxxxx
+occtl s todo ses_xxxxx
 ```
 
-### PROMPT.md Template
+**5. Evaluate and decide.** After each iteration:
+- Read the worker's output with `occtl s last ses_xxxxx`
+- Check `tasks.md` to see what was marked done
+- Check `progress.txt` for the worker's notes
+- If the task failed or was only partially done, adjust the next prompt
+- If the worker got stuck, break the task into smaller pieces
+- If all tasks are done, stop
 
-A good Ralph Loop prompt tells the agent exactly how to work each iteration:
+**6. Repeat** until `tasks.md` shows all tasks complete.
 
-```markdown
-# Task Execution Prompt
+### Key Commands for Orchestration
 
-You are working through a task list autonomously. Each iteration you have fresh
-context, so you MUST read the current state from the filesystem.
+| What you need to do | Command |
+|---|---|
+| Create a fresh session | `occtl s create -q -t "ralph-N"` |
+| Send prompt to a session | `occtl s send --async "prompt text" -s <id>` |
+| Auto-approve permissions | `occtl s respond <id> --auto-approve --wait` |
+| Wait for session to finish | `occtl s wait-for-idle <id> --timeout 600` |
+| Quick status check | `occtl s is-idle <id>` (exit 0=idle, 1=busy) |
+| Get session overview | `occtl s summary <id>` |
+| Read last assistant message | `occtl s last <id>` |
+| Read full message history | `occtl s messages <id> --text-only` |
+| Check todo progress | `occtl s todo <id>` |
+| Check file changes | `occtl s diff <id>` |
+| Wait for first of N to finish | `occtl s wait-any <id1> <id2> <id3>` |
+| Abort a stuck session | `occtl s abort <id>` |
 
-## Instructions
+### Parallel Execution
 
-1. Read `tasks.md` to see what needs to be done
-2. Read `progress.txt` to see what has already been completed
-3. Pick the highest-priority incomplete task
-4. Implement it fully — write code, run tests, fix errors
-5. Commit your changes with a descriptive message
-6. Update `tasks.md` to mark the task as done
-7. Append a brief summary of what you did to `progress.txt`
+For independent tasks, run multiple sessions simultaneously:
 
-## Rules
+```bash
+# Create sessions for independent tasks
+SID1=$(occtl s create -q -t "task-auth")
+SID2=$(occtl s create -q -t "task-payments")
+SID3=$(occtl s create -q -t "task-dashboard")
 
-- Do ONE task per iteration. Do not try to do multiple tasks.
-- Run the test suite before marking a task complete.
-- If tests fail, fix them before moving on.
-- If you are stuck on a task after a reasonable attempt, note the blocker in
-  `progress.txt` and move to the next task.
+# Send prompts to all three
+occtl s send --async "implement JWT auth. Read tasks.md..." -s $SID1
+occtl s send --async "add Stripe checkout. Read tasks.md..." -s $SID2
+occtl s send --async "build analytics dashboard. Read tasks.md..." -s $SID3
 
-## Completion Signals
+# Wait for the first one to finish
+FINISHED=$(occtl s wait-any $SID1 $SID2 $SID3 --timeout 600)
+# $FINISHED contains the session ID that went idle first
 
-- When you finish this iteration's task, output: RALPH_DONE
-- When ALL tasks in `tasks.md` are complete, output: ALL_TASKS_COMPLETE
+# Check its result
+occtl s summary $FINISHED
 ```
 
-### Tips
+When tasks would modify the same files, use worktrees for isolation:
 
-- **One task per iteration.** This is the core Ralph principle. Trying to do too much in one pass leads to context rot and half-finished work.
-- **Keep tasks atomic.** Each task should be completable within a single context window. If a task is too big, break it into subtasks before starting the loop.
-- **Use `wait-for-text` over polling.** It's event-driven (SSE) so it reacts instantly and uses no CPU while waiting, unlike a `sleep`/poll loop.
-- **Use `--check-existing` on the final completion check.** The agent may have written `ALL_TASKS_COMPLETE` in the same message as `RALPH_DONE`, so check existing messages rather than waiting for a new one.
-- **Auto-approve permissions carefully.** For trusted codebases, `--auto-approve` is fine. For untrusted work, omit it and let the agent block on permission requests (you can respond manually via another terminal).
-- **Inspect between iterations.** Unlike a raw bash loop, `occtl` lets you `occtl s last`, `occtl s todo`, and `occtl s diff` between iterations to observe what the agent actually did.
-- **Set a timeout.** Always use `--timeout` with `wait-for-text` to prevent infinite hangs if the agent gets stuck or never produces the completion signal.
-- **Progress file as memory.** The agent has no memory across iterations. The `progress.txt` file IS its memory. Keep it concise — append summaries, not full transcripts.
-- **Use `send --wait` for simpler loops.** If you don't need completion signals and just want to block until the agent finishes, `occtl s send -w` is simpler than `send --async` + `wait-for-text`. It sends the message, blocks until `session.idle`, and prints the last assistant message.
-- **`session delete` lives in `opencode`.** Use `opencode session delete <id>` to clean up sessions after a Ralph loop. This was intentionally not duplicated in `occtl`.
+```bash
+# Create isolated worktrees for conflicting work
+WT1=$(occtl wt create auth -q)
+WT2=$(occtl wt create payments -q)
+
+# Sessions are auto-created in worktree directories
+# Send prompts, wait, then merge branches when done
+```
+
+### Handling Failures
+
+When a worker session fails or produces bad output:
+
+1. **Read the output**: `occtl s last <id>` — understand what went wrong
+2. **Check for errors**: `occtl s summary <id> --json` — look at the error field
+3. **Decide**:
+   - If the task is too big, break it into subtasks in `tasks.md`
+   - If the worker misunderstood, refine the prompt and retry
+   - If there's a dependency, reorder tasks
+   - If it's a transient error, simply retry with a new session
+4. **Create a new session and try again** — never reuse a failed session
+
+### Example: Full Ralph Mode Session
+
+Here is how you (the agent) would orchestrate a project. You are talking to
+yourself — these are the bash commands you would execute:
+
+```
+# 1. Read the project
+cat tasks.md     # understand what needs doing
+cat progress.txt # see what's done so far
+
+# 2. Iteration 1: first task
+SID=$(occtl s create -q -t "ralph-1-add-user-model")
+occtl s send --async "You are working on a project. Read tasks.md and progress.txt.
+Pick the first incomplete task and implement it. Run tests. Update tasks.md and
+progress.txt when done. Commit your changes." -s $SID
+occtl s respond $SID --auto-approve --wait &
+occtl s wait-for-idle $SID --timeout 600
+occtl s summary $SID
+# Read output to see what happened
+occtl s last $SID
+
+# 3. Check progress
+cat tasks.md     # was the task marked done?
+cat progress.txt # what did the worker report?
+
+# 4. Iteration 2: next task
+SID=$(occtl s create -q -t "ralph-2-add-api-endpoints")
+occtl s send --async "..." -s $SID
+# ... repeat
+
+# 5. When tasks.md shows all tasks done: stop and report to the user.
+```
+
+### Guidelines
+
+- **One task per session.** This is the core principle. Fresh context = better quality.
+- **You are the brains, workers are the hands.** Workers implement. You plan,
+  evaluate, and adapt. Don't expect workers to make strategic decisions.
+- **Read worker output between iterations.** Use `occtl s last` and
+  `occtl s summary` to understand what actually happened before deciding
+  what to do next.
+- **Adjust prompts based on results.** If a worker misunderstood, clarify.
+  If a task was too big, break it down. This is where you add intelligence
+  that a bash loop cannot.
+- **Use parallel sessions for independent work.** Use `wait-any` to react
+  to whichever finishes first, then dispatch the next task.
+- **Use worktrees when parallel tasks touch the same files.** Merge after.
+- **Keep `progress.txt` lean.** Workers append to it, you may edit it to
+  keep it useful. Trim old entries if it gets too long.
+- **Commit early, commit often.** Tell workers to commit after each task.
+  Git history is the real memory.
+- **Set timeouts.** Always use `--timeout` with wait commands to avoid
+  hanging forever on a stuck session.
+- **Report progress to the user.** Periodically summarize what's been done
+  and what remains. The user should be able to check in and see status.

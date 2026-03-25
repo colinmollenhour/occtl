@@ -72,6 +72,10 @@ export OPENCODE_SERVER_PORT=4096
 | `session share` | Share a session and get a public URL |
 | `session unshare` | Remove sharing from a session |
 | `session wait-for-text` | Block until a message contains given text, then exit 0 |
+| `session wait-for-idle` | Block until a session goes idle |
+| `session wait-any` | Wait for first of N sessions to go idle, output its ID |
+| `session is-idle` | Non-blocking idle check (exit 0=idle, 1=busy) |
+| `session summary` | Compact overview: status, todos, cost, last message snippet |
 
 ### Worktree Commands
 
@@ -146,91 +150,47 @@ To view the skill without installing:
 occtl view-skill
 ```
 
-## Ralph Loop
+## Ralph Mode
 
-The [Ralph Loop](https://ghuntley.com/ralph/) (aka "Ralph Wiggum pattern") is an autonomous coding technique where an AI agent works through a task list in a loop, with fresh context each iteration. `occtl` makes this pattern smarter than a raw bash loop with event-driven completion detection, permission auto-approval, and inter-iteration inspection.
+The [Ralph Loop](https://ghuntley.com/ralph/) is an autonomous coding pattern where an AI agent works through tasks in a loop with fresh context each iteration. Traditionally this requires a bash script to drive the loop.
 
-### Minimal Example
+`occtl` eliminates the bash script entirely. With Ralph Mode, **the agent IS the orchestrator**. It creates sessions, sends prompts, monitors progress, handles failures, and keeps iterating — all through `occtl` commands. No bash wrapper needed.
 
-```bash
-#!/usr/bin/env bash
-set -e
+To start: tell your agent "Use the occtl skill to complete project X using Ralph Mode." The skill teaches the agent to:
 
-MAX_ITERATIONS=${1:-10}
+1. Break work into atomic tasks (`tasks.md`)
+2. Create a fresh session per task (`occtl s create`)
+3. Send the worker a prompt with context (`occtl s send --async`)
+4. Wait for completion (`occtl s wait-for-idle`)
+5. Evaluate output (`occtl s summary`, `occtl s last`)
+6. Repeat until all tasks are done
 
-for i in $(seq 1 "$MAX_ITERATIONS"); do
-  echo "=== Iteration $i/$MAX_ITERATIONS ==="
-
-  # Fresh session each iteration
-  SID=$(occtl s create -q -t "ralph-$i")
-
-  # Send the prompt
-  occtl s send --async "$(cat PROMPT.md)" -s "$SID"
-
-  # Auto-approve permissions
-  occtl s respond "$SID" --auto-approve --wait &
-  APPROVE_PID=$!
-
-  # Wait for completion signal
-  if occtl s wait-for-text "RALPH_DONE" "$SID" --timeout 600; then
-    echo "=== Iteration $i complete ==="
-  else
-    echo "=== Iteration $i timed out ==="
-  fi
-
-  kill $APPROVE_PID 2>/dev/null || true
-
-  # Check if all tasks are done
-  if occtl s wait-for-text "ALL_TASKS_DONE" "$SID" \
-       --check-existing --timeout 1; then
-    echo "=== All tasks complete! ==="
-    break
-  fi
-done
-```
-
-### Parallel Ralph Loops with Worktrees
-
-Run independent features in parallel, each with its own worktree and Ralph loop:
+### Parallel Execution
 
 ```bash
-#!/usr/bin/env bash
-set -e
+# Agent creates 3 sessions for independent tasks
+SID1=$(occtl s create -q -t "task-auth")
+SID2=$(occtl s create -q -t "task-payments")
+SID3=$(occtl s create -q -t "task-dashboard")
 
-FEATURES=("auth" "payments" "dashboard")
+# Sends prompts to all three
+occtl s send --async "implement JWT auth..." -s $SID1
+occtl s send --async "add Stripe checkout..." -s $SID2
+occtl s send --async "build dashboard..." -s $SID3
 
-for feature in "${FEATURES[@]}"; do
-  (
-    WT_PATH=$(occtl wt create "$feature" -q)
-
-    for i in $(seq 1 10); do
-      SID=$(occtl s create -q -t "ralph-${feature}-$i")
-
-      occtl s send --async "$(cat prompts/${feature}.md)
-## Progress
-$(cat ${WT_PATH}/progress.txt 2>/dev/null || echo 'Starting fresh.')
-When done, output RALPH_DONE. If ALL tasks complete, output ALL_TASKS_COMPLETE." -s "$SID"
-
-      occtl s respond "$SID" --auto-approve --wait &
-      APID=$!
-      occtl s wait-for-text "RALPH_DONE" "$SID" --timeout 600 || true
-      kill $APID 2>/dev/null || true
-
-      occtl s last "$SID" >> "${WT_PATH}/progress.txt"
-
-      if occtl s wait-for-text "ALL_TASKS_COMPLETE" "$SID" \
-           --check-existing --timeout 1; then
-        break
-      fi
-    done
-  ) &
-done
-
-wait
-echo "All features complete. Review worktrees and merge."
+# Waits for first to finish, evaluates, dispatches next
+DONE=$(occtl s wait-any $SID1 $SID2 $SID3)
+occtl s summary $DONE
 ```
 
-See `occtl view-skill` for the full guide with PROMPT.md template and tips.
+For conflicting work, use worktrees:
+
+```bash
+occtl wt run auth -w "implement JWT auth"
+occtl wt run payments -w "add Stripe checkout"
+```
+
+See `occtl view-skill` for the full Ralph Mode guide.
 
 ## Why Not Just Use opencode CLI?
 
