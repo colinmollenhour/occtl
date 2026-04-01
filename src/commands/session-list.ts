@@ -22,6 +22,7 @@ export function sessionListCommand(): Command {
       "updated"
     )
     .option("--asc", "Sort ascending instead of descending")
+    .option("--active", "Only show non-idle sessions (busy or retry)")
     .action(async (directory: string | undefined, opts) => {
       const client = await ensureServer();
 
@@ -48,6 +49,16 @@ export function sessionListCommand(): Command {
       // Filter out child sessions unless --children
       if (!opts.children) {
         sessions = sessions.filter((s) => !s.parentID);
+      }
+
+      // Filter to non-idle sessions if --active
+      if (opts.active) {
+        const statusResult = await client.session.status();
+        const statuses = statusResult.data ?? {};
+        sessions = sessions.filter((s) => {
+          const status = statuses[s.id];
+          return status && status.type !== "idle";
+        });
       }
 
       // Sort

@@ -39,6 +39,7 @@ occtl list --children         # include child sessions (sub-agents)
 occtl list --json             # JSON output for scripting
 occtl list --detailed         # show full details per session
 occtl list --limit 5          # limit results
+occtl list --active           # only non-idle sessions (busy or retry)
 occtl list --sort created     # sort by: updated (default), created, title
 occtl list --sort title --asc # sort ascending
 ```
