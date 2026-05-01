@@ -10,7 +10,7 @@ export function sessionStreamCommand(): Command {
     .description(
       "Send a message and stream events live (text deltas + tool calls) until the session is idle"
     )
-    .argument("<message...>", "Message text to send")
+    .argument("[message...]", "Message text to send (omit when --stdin is used)")
     .option("-s, --session <id>", "Session ID (defaults to most recent)")
     .option("-j, --json", "Emit each event as a JSON line (NDJSON) instead of formatted output")
     .option("--no-reply", "Send as context injection (no AI response)")
@@ -18,7 +18,7 @@ export function sessionStreamCommand(): Command {
     .option("--model <model>", "Model to use (format: provider/model)")
     .option("--variant <variant>", "Model variant to use (e.g. high)")
     .option("--stdin", "Read message from stdin instead of arguments")
-    .action(async (messageParts: string[], opts) => {
+    .action(async (messageParts: string[] | undefined, opts) => {
       const client = await ensureServer();
       const clientV2 = getClientV2();
       const resolved = await resolveSession(client, opts.session);
@@ -31,7 +31,7 @@ export function sessionStreamCommand(): Command {
         }
         messageText = Buffer.concat(chunks).toString("utf-8").trim();
       } else {
-        messageText = messageParts.join(" ");
+        messageText = (messageParts ?? []).join(" ");
       }
 
       if (!messageText) {

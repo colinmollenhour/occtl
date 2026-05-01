@@ -10,7 +10,7 @@ export function sessionSendCommand(): Command {
   return new Command("send")
     .alias("prompt")
     .description("Send a message to a session")
-    .argument("<message...>", "Message text to send")
+    .argument("[message...]", "Message text to send (omit when --stdin is used)")
     .option("-s, --session <id>", "Session ID (defaults to most recent)")
     .option("-j, --json", "Output response as JSON")
     .option("-v, --verbose", "Show tool calls and extra details")
@@ -25,7 +25,7 @@ export function sessionSendCommand(): Command {
     .option("--model <model>", "Model to use (format: provider/model)")
     .option("--variant <variant>", "Model variant to use (e.g. high)")
     .option("--stdin", "Read message from stdin instead of arguments")
-    .action(async (messageParts: string[], opts) => {
+    .action(async (messageParts: string[] | undefined, opts) => {
       const client = await ensureServer();
       const clientV2 = getClientV2();
       const resolved = await resolveSession(client, opts.session);
@@ -38,7 +38,7 @@ export function sessionSendCommand(): Command {
         }
         messageText = Buffer.concat(chunks).toString("utf-8").trim();
       } else {
-        messageText = messageParts.join(" ");
+        messageText = (messageParts ?? []).join(" ");
       }
 
       if (!messageText) {
