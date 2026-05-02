@@ -68,7 +68,7 @@ export OPENCODE_SERVER_PASSWORD=...   # if the server requires HTTP Basic auth
 | `send` | Send a message (`--async`, `--wait`, `--model`, `--agent`, `--variant`, `--stdin`) |
 | `stream` | Send a message and stream events live until idle (`--json` for NDJSON) |
 | `respond` | Respond to permission requests (`--auto-approve`, `--wait`) |
-| `models` | List providers/models/variants from `/config/providers` (`--enabled`, `--json`) |
+| `models` | List/search providers/models/variants from `/config/providers` (`--grep`, `--enabled`, `--json`) |
 | `todo` | View the session's todo list |
 | `abort` | Abort a running session |
 | `diff` | Show file changes in a session |
@@ -166,10 +166,14 @@ occtl rm <id>            # delete session and its defaults file
 ```bash
 occtl models                       # list all providers and models
 occtl models --enabled             # only providers with credentials present
+occtl models --grep gpt-5.5        # print full matching provider/model IDs
+occtl models --enabled --grep opus  # search only usable configured providers
 occtl models openai                # list openai's models with their variants
 occtl models openai/gpt-5.5        # detail view: limits + variants
 occtl models --json                # raw output of /config/providers
 ```
+
+Use `--grep` instead of piping to shell `grep`/`head`; it preserves provider IDs and returns ready-to-use model strings like `openai/gpt-5.5` and `openrouter/openai/gpt-5.5`.
 
 ## Worktrees
 

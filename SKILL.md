@@ -38,7 +38,8 @@ occtl abort <id>                   # stop work
 occtl share <id>                   # public URL
 occtl unshare <id>                 # remove public sharing
 occtl children <id>                # child sessions
-occtl models --enabled             # usable providers/models/variants
+occtl models --grep gpt-5.5        # full matching provider/model IDs
+occtl models --enabled --grep opus  # search usable configured providers
 occtl install-skill --force         # install bundled skill
 occtl view-skill --path             # locate bundled skill
 occtl help <command>                # command-specific help

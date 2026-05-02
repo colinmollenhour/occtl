@@ -16,7 +16,13 @@ interface Provider {
   source?: string;
   key?: string;
   env?: string[];
+  options?: { apiKey?: string; [key: string]: unknown };
   models: { [id: string]: Model };
+}
+
+interface ModelMatch {
+  provider: Provider;
+  model: Model;
 }
 
 export function modelsCommand(): Command {
@@ -31,7 +37,11 @@ export function modelsCommand(): Command {
     .option("-j, --json", "Output as JSON")
     .option(
       "--enabled",
-      "Only show providers that have credentials present (key set on the server)"
+      "Only show providers that have credentials present"
+    )
+    .option(
+      "--grep <text>",
+      "Search models by provider/model ID or display name; prints full provider/model IDs"
     )
     .action(async (selector: string | undefined, opts) => {
       // ensureServer uses v1 just for the health check; the actual call is v2.
@@ -47,7 +57,7 @@ export function modelsCommand(): Command {
       let providers = (result.data.providers ?? []) as Provider[];
 
       if (opts.enabled) {
-        providers = providers.filter((p) => !!p.key);
+        providers = providers.filter(hasCredentials);
       }
 
       let providerFilter: string | undefined;
@@ -69,6 +79,36 @@ export function modelsCommand(): Command {
       if (providerFilter && filtered.length === 0) {
         console.error(`Provider '${providerFilter}' not found.`);
         process.exit(1);
+      }
+
+      if (opts.grep) {
+        const matches = findModelMatches(filtered, opts.grep);
+        if (matches.length === 0) {
+          console.error(`No models matched '${opts.grep}'.`);
+          process.exit(1);
+        }
+
+        if (opts.json) {
+          console.log(
+            formatJSON({
+              models: matches.map(({ provider, model }) => ({
+                providerID: provider.id,
+                id: model.id,
+                fullID: `${provider.id}/${model.id}`,
+                name: model.name,
+                status: model.status,
+                variants: model.variants ? Object.keys(model.variants) : [],
+              })),
+              default: result.data.default,
+            })
+          );
+          return;
+        }
+
+        for (const { provider, model } of matches) {
+          printModelLine(provider.id, model);
+        }
+        return;
       }
 
       if (modelFilter) {
@@ -102,15 +142,41 @@ export function modelsCommand(): Command {
         if (models.length === 0) continue;
         console.log(`${provider.id} (${provider.name})`);
         for (const model of models) {
-          const variantNames = model.variants ? Object.keys(model.variants) : [];
-          const variantStr =
-            variantNames.length > 0 ? `  variants: ${variantNames.join(", ")}` : "";
-          const statusStr = model.status === "active" ? "" : ` [${model.status}]`;
-          console.log(`  ${model.id}${statusStr}${variantStr}`);
+          printModelLine("", model, "  ");
         }
         console.log();
       }
     });
+}
+
+function hasCredentials(provider: Provider): boolean {
+  return !!provider.key || !!provider.options?.apiKey;
+}
+
+function findModelMatches(providers: Provider[], grep: string): ModelMatch[] {
+  const query = grep.toLowerCase();
+  const matches: ModelMatch[] = [];
+
+  for (const provider of providers) {
+    for (const model of Object.values(provider.models)) {
+      const fullID = `${provider.id}/${model.id}`;
+      const haystack = [fullID, model.id, model.name].join("\n").toLowerCase();
+      if (haystack.includes(query)) {
+        matches.push({ provider, model });
+      }
+    }
+  }
+
+  return matches;
+}
+
+function printModelLine(providerId: string, model: Model, indent = ""): void {
+  const variantNames = model.variants ? Object.keys(model.variants) : [];
+  const variantStr =
+    variantNames.length > 0 ? `  variants: ${variantNames.join(", ")}` : "";
+  const statusStr = model.status === "active" ? "" : ` [${model.status}]`;
+  const id = providerId ? `${providerId}/${model.id}` : model.id;
+  console.log(`${indent}${id}${statusStr}${variantStr}`);
 }
 
 function printModelDetail(providerId: string, model: Model): void {
