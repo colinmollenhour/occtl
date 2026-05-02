@@ -28,6 +28,9 @@ occtl send "fix the failing tests"
 # Auto-approve all permission requests
 occtl respond --auto-approve --wait
 
+# One-shot prompt: create + send + wait + write — optionally with its own opencode server
+occtl run --spawn --model openai/gpt-5.4 --file ./prompt.md --out ./result.md
+
 # Run a task in an isolated worktree
 occtl worktree run auth -w "implement JWT authentication"
 ```
@@ -45,6 +48,7 @@ occtl wt run payments -w "add Stripe checkout"
 ```bash
 export OPENCODE_SERVER_HOST=127.0.0.1
 export OPENCODE_SERVER_PORT=4096
+export OPENCODE_SERVER_PASSWORD=...   # if the server requires HTTP Basic auth
 ```
 
 ## Commands
@@ -348,6 +352,7 @@ The `opencode` CLI provides `session list` and `session delete`. Everything else
 - **Read messages** from any session
 - **Watch** sessions in real-time via SSE
 - **Send prompts** programmatically (sync, async, or wait-for-idle)
+- **One-shot runs** with `occtl run`, optionally spawning an ephemeral server (`--spawn`)
 - **Respond** to permission requests (including continuous auto-approve)
 - **Wait for text** in agent output (event-driven, not polling)
 - **Create** sessions for fresh-context workflows

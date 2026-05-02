@@ -34,13 +34,18 @@ interface RunOpts {
 export function sessionRunCommand(): Command {
   return new Command("run")
     .description(
-      "Run a one-shot prompt: create a session, send, wait for completion, write the assistant text. " +
-        "With --spawn, fires up an ephemeral `opencode serve` and tears it down at the end."
+      "One-shot prompt: create a session, send, wait for completion, write the response. " +
+        "Use --spawn to run against an ephemeral `opencode serve`."
     )
+    // Model behavior
     .option("-m, --model <provider/model>", "Model (required, e.g. anthropic/claude-opus-4-7)")
     .option("--variant <name>", "Model variant (e.g. high, xhigh, max)")
     .option("--agent <name>", "Agent name")
+    .option("--thinking", "Forward thinking flag to the model")
+    // Session
     .option("-t, --title <title>", "Session title")
+    .option("-d, --dir <path>", "Project directory for the session (default: cwd)")
+    // Prompt
     .option(
       "-f, --file <path>",
       "Prompt file (repeatable; concatenated into a single text part)",
@@ -48,16 +53,17 @@ export function sessionRunCommand(): Command {
       [] as string[]
     )
     .option("--message <text>", "Short text appended to the prompt after files")
-    .option("-d, --dir <path>", "Project directory for the session (default: cwd)")
+    // Output sinks
     .option("-o, --out <path>", "Write assistant text to this file (default: stdout)")
-    .option("--stderr <path>", "Capture run-level diagnostics to this file")
     .option("--raw <path>", "Write the full last assistant message JSON to this file")
-    .option("--timeout <ms>", "Abort if not idle within this many ms")
-    .option("--thinking", "Forward thinking flag to the model")
-    .option("--spawn", "Spawn an ephemeral `opencode serve` instead of using a running server")
-    .option("--spawn-port <port>", "(with --spawn) bind to this port instead of a random free one")
-    .option("--password <pw>", "Server password (also reads OPENCODE_SERVER_PASSWORD)")
+    .option("--stderr <path>", "Capture run-level diagnostics to this file")
+    // Run control
+    .option("--timeout <ms>", "Abort if not idle within this many ms (exits 124)")
     .option("--ephemeral", "Delete the session after the run completes successfully")
+    // Server
+    .option("--spawn", "Spawn an ephemeral `opencode serve` instead of using a running server")
+    .option("--spawn-port <port>", "Bind --spawn to this port instead of a random free one")
+    .option("--password <pw>", "Server password (also reads OPENCODE_SERVER_PASSWORD)")
     .argument("[message...]", "Trailing message text (alternative to --message)")
     .action(async (positionalParts: string[], opts: RunOpts) => {
       await runAction(positionalParts, opts);
