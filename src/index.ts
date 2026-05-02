@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
+import { pingCommand } from "./commands/ping.js";
 import { sessionListCommand } from "./commands/session-list.js";
 import { sessionGetCommand } from "./commands/session-get.js";
 import { sessionMessagesCommand } from "./commands/session-messages.js";
@@ -57,6 +58,7 @@ program
   .version(pkg.version);
 
 // Session commands (top-level)
+program.addCommand(pingCommand());
 program.addCommand(sessionListCommand());
 program.addCommand(sessionCreateCommand());
 program.addCommand(sessionDeleteCommand());

@@ -55,6 +55,7 @@ export OPENCODE_SERVER_PASSWORD=...   # if the server requires HTTP Basic auth
 
 | Command | Description |
 |---------|-------------|
+| `ping` | Check that an OpenCode server is reachable and print the connected host |
 | `list` (`ls`) | List sessions (filters by cwd, supports `--all`, path arg, `--sort`, `--asc`, `--orphans`) |
 | `create` | Create a new session (`-q` for ID, `-t` for title, `-d` for directory, `--model`/`--agent`/`--variant` for persisted defaults) |
 | `run` | One-shot prompt: create session, send, wait for response, write text. Supports `--spawn` for ephemeral server. |
