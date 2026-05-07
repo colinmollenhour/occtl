@@ -9,6 +9,7 @@ import {
   getMessageCostAndTokens,
   hasTokenUsage,
 } from "../format.js";
+import { deriveSessionStatus } from "../status-util.js";
 
 export function sessionSummaryCommand(): Command {
   return new Command("summary")
@@ -27,23 +28,25 @@ export function sessionSummaryCommand(): Command {
       const client = await ensureServer();
       const resolved = await resolveSession(client, sessionId);
 
-      // Fetch session info, status, messages, and todos in parallel
-      const [sessionResult, statusResult, messagesResult, todoResult] =
+      // Fetch session info, status, messages, todos, and child-session info in parallel
+      const [sessionResult, statusResult, messagesResult, todoResult, sessionsResult] =
         await Promise.all([
           client.session.get({ path: { id: resolved } }),
           client.session.status(),
           client.session.messages({ path: { id: resolved } }),
           client.session.todo({ path: { id: resolved } }),
+          client.session.list({}),
         ]);
 
       const session = sessionResult.data;
       const statuses = statusResult.data ?? {};
       const messages = messagesResult.data ?? [];
       const todos = todoResult.data ?? [];
+      const sessions = sessionsResult.data ?? [];
 
       // Compute status
-      const statusEntry = statuses[resolved];
-      const status = statusEntry?.type ?? "idle";
+      const derivedStatus = deriveSessionStatus(resolved, statuses, sessions);
+      const status = derivedStatus.type;
 
       // Compute todo progress
       const todoTotal = todos.length;
@@ -97,6 +100,9 @@ export function sessionSummaryCommand(): Command {
         sessionID: resolved,
         title: session?.title || "(untitled)",
         status,
+        mainStatus: derivedStatus.main,
+        allIdle: derivedStatus.allIdle,
+        activeChildren: derivedStatus.activeChildren,
         updated: session?.time.updated
           ? formatTimeAgo(session.time.updated)
           : "unknown",

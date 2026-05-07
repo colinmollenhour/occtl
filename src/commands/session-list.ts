@@ -3,6 +3,7 @@ import path from "path";
 import { ensureServer } from "../client.js";
 import { formatSession, formatSessionDetailed, formatJSON } from "../format.js";
 import { listStoredSessionIds, readDefaults } from "../session-defaults.js";
+import { deriveSessionStatus } from "../status-util.js";
 import type { Session } from "@opencode-ai/sdk";
 
 export function sessionListCommand(): Command {
@@ -23,7 +24,11 @@ export function sessionListCommand(): Command {
       "updated"
     )
     .option("--asc", "Sort ascending instead of descending")
-    .option("--active", "Only show non-idle sessions (busy or retry)")
+    .option("--active", "Only show sessions where the main agent or a child agent is active")
+    .option(
+      "--main-agent",
+      "With --active, only check the main agent status and ignore child sessions"
+    )
     .option(
       "--orphans",
       "Instead of listing sessions, show locally-persisted defaults files whose session no longer exists on the server"
@@ -90,11 +95,16 @@ export function sessionListCommand(): Command {
 
       // Filter to non-idle sessions if --active
       if (opts.active) {
-        const statusResult = await client.session.status();
+        const [statusResult, allSessionsResult] = await Promise.all([
+          client.session.status(),
+          client.session.list({}),
+        ]);
         const statuses = statusResult.data ?? {};
+        const allSessions = allSessionsResult.data ?? [];
         sessions = sessions.filter((s) => {
           const status = statuses[s.id];
-          return status && status.type !== "idle";
+          if (opts.mainAgent) return status && status.type !== "idle";
+          return !deriveSessionStatus(s.id, statuses, allSessions).allIdle;
         });
       }
 

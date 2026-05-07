@@ -18,7 +18,7 @@ Most commands support `--json`. Prefer JSON for scripts.
 ```bash
 occtl ping                        # verify server reachable
 occtl list                        # sessions in current dir
-occtl list --all --active          # all busy/retry sessions
+occtl list --all --active          # sessions with active main/child agents
 occtl list --orphans               # local defaults with no live session
 occtl create -q                    # print new session ID
 occtl new -q                       # alias for create
@@ -33,7 +33,7 @@ occtl watch <id> --text-only       # live text stream
 occtl summary <id>                 # status + todos + cost + diff summary
 occtl todo <id>                    # todo list
 occtl diff <id>                    # file changes
-occtl status <id>                  # idle/busy/retry
+occtl status <id>                  # idle/waiting/busy/retry
 occtl abort <id>                   # stop work
 occtl share <id>                   # public URL
 occtl unshare <id>                 # remove public sharing
@@ -61,7 +61,7 @@ occtl stream -s <id> "prompt"               # send + stream until idle
 occtl stream --json -s <id> "prompt"        # NDJSON event stream
 ```
 
-Use `stream` or `send -w` for race-safe single-session automation. If using `send --async`, wait with `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
+Use `stream` or `send -w` for race-safe single-session automation. Parent sessions with active sub-agents report `waiting`; pass `--main-agent` to `status`, `wait-for-idle`, or `is-idle` only when parent-only status is intended. If using `send --async`, wait with `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
 
 Persist worker defaults at create time:
 
@@ -89,10 +89,12 @@ occtl respond <id> --auto-approve --wait
 
 occtl wait-for-idle <id> --timeout 600
 occtl wait-for-idle <id> --require-busy --timeout 600
+occtl wait-for-idle <id> --main-agent --timeout 600
 occtl wait-for-text "DONE" <id> --timeout 600
 occtl wait-any <id1> <id2> <id3> --timeout 600
 occtl wait-all <id1> <id2> <id3> --require-busy --timeout 600
 occtl is-idle <id> --require-busy
+occtl is-idle <id> --main-agent
 ```
 
 Race rule: new sessions may report idle before async prompt starts. After `send --async`, use `--require-busy`, `wait-for-text`, `send -w`, or `stream`.

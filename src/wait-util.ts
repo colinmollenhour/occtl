@@ -1,6 +1,7 @@
 import type { OpencodeClient } from "@opencode-ai/sdk";
 import { startStream, startAllStream, getEventSessionId } from "./sse.js";
 import type { StreamResult } from "./sse.js";
+import { getDerivedSessionStatus } from "./status-util.js";
 
 export interface WaitResult {
   /** Whether the session is confirmed idle. */
@@ -18,9 +19,10 @@ export async function waitForIdle(
   client: OpencodeClient,
   sessionId: string,
   timeoutMs?: number,
-  options?: { requireBusy?: boolean }
+  options?: { requireBusy?: boolean; mainAgentOnly?: boolean }
 ): Promise<WaitResult> {
   const requireBusy = options?.requireBusy ?? false;
+  const mainAgentOnly = options?.mainAgentOnly ?? false;
   return new Promise<WaitResult>((resolve) => {
     let settled = false;
     const settle = (result: WaitResult) => {
@@ -39,12 +41,38 @@ export async function waitForIdle(
       }, timeoutMs);
     }
 
-    // Start SSE stream
-    const handle = startStream(sessionId, (event) => {
+    const checkAllAgentsIdle = async (
+      reason: WaitResult["reason"],
+      eventSessionId?: string
+    ) => {
+      if (settled) return;
+      try {
+        const status = await getDerivedSessionStatus(client, sessionId);
+        if (
+          eventSessionId &&
+          eventSessionId !== sessionId &&
+          !status.children.includes(eventSessionId)
+        ) {
+          return;
+        }
+        if (requireBusy && !status.mainKnown) return;
+        if (status.allIdle) settle({ idle: true, reason });
+      } catch {
+        // API check failed; rely on later SSE events or timeout.
+      }
+    };
+
+    // Start SSE stream. When child sessions matter, listen to all session.idle
+    // events because the parent can be idle while a sub-agent is still running.
+    const handle = mainAgentOnly ? startStream(sessionId, (event) => {
       if (event.type === "session.idle") {
         settle({ idle: true, reason: "sse" });
         return "stop";
       }
+    }) : startAllStream((event) => {
+      if (event.type !== "session.idle") return;
+      const sid = getEventSessionId(event);
+      if (sid) void checkAllAgentsIdle("sse", sid);
     });
 
     // When stream ends unexpectedly
@@ -62,11 +90,15 @@ export async function waitForIdle(
       handle.connected.then(async () => {
         if (settled) return;
         try {
-          const statusResult = await client.session.status();
-          const statuses = statusResult.data ?? {};
-          const current = statuses[sessionId];
-          if (!current || current.type === "idle") {
-            settle({ idle: true, reason: "api" });
+          if (mainAgentOnly) {
+            const statusResult = await client.session.status();
+            const statuses = statusResult.data ?? {};
+            const current = statuses[sessionId];
+            if (!current || current.type === "idle") {
+              settle({ idle: true, reason: "api" });
+            }
+          } else {
+            await checkAllAgentsIdle("api");
           }
         } catch {
           // API check failed; rely on SSE stream

@@ -59,7 +59,7 @@ occtl run --spawn --model openai/gpt-5.4 "Summarize this repository in five bull
 
 ```bash
 occtl list                         # sessions for the current directory
-occtl list --all --active           # busy or retry sessions across directories
+occtl list --all --active           # sessions with active main or child agents
 occtl summary                       # compact status for the most recent session
 occtl messages --text-only          # readable transcript
 occtl last                          # last assistant message
@@ -80,17 +80,19 @@ occtl stream "implement the parser"             # stream tool calls and text unt
 occtl stream --json "run verification"          # newline-delimited JSON events
 ```
 
-Use `stream` or `send --wait` for single-session automation. If you use `send --async` and then poll, pass `--require-busy` to `wait-for-idle`, `wait-all`, or `is-idle` so a fresh session does not appear idle before the prompt starts.
+Use `stream` or `send --wait` for single-session automation. `status`, `summary`, `list --active`, `wait-for-idle`, and `is-idle` treat a parent session with active sub-agents as `waiting`, not idle. Pass `--main-agent` when you specifically want the parent agent's own status. If you use `send --async` and then poll, pass `--require-busy` to `wait-for-idle`, `wait-all`, or `is-idle` so a fresh session does not appear idle before the prompt starts.
 
 ### Wait for completion
 
 ```bash
 occtl wait-for-idle "$SID" --timeout 600
 occtl wait-for-idle "$SID" --require-busy --timeout 600
+occtl wait-for-idle "$SID" --main-agent --timeout 600
 occtl wait-for-text "DONE" "$SID" --timeout 600
 occtl wait-any "$SID1" "$SID2" "$SID3" --timeout 600
 occtl wait-all "$SID1" "$SID2" "$SID3" --require-busy --timeout 600
 occtl is-idle "$SID" --require-busy
+occtl is-idle "$SID" --main-agent
 ```
 
 Use `wait-any` to react when the first worker finishes. Use `wait-all` as a barrier before verification, merge work, or a final report.
@@ -245,7 +247,7 @@ The password is sent with HTTP Basic authentication using the `opencode` usernam
 | `get`, `show` | Show session details and stored defaults. |
 | `messages`, `msgs` | List session messages. |
 | `last` | Print the last message, usually as text. |
-| `status` | Show idle, busy, and retry status. |
+| `status` | Show idle, waiting, busy, and retry status. |
 | `watch` | Watch real-time session events. |
 | `send`, `prompt` | Send a message to a session. |
 | `stream` | Send a message and stream events until the session becomes idle. |
@@ -259,10 +261,10 @@ The password is sent with HTTP Basic authentication using the `opencode` usernam
 | `share` | Share a session and print the public URL. |
 | `unshare` | Remove public sharing from a session. |
 | `wait-for-text` | Wait until a message contains specific text. |
-| `wait-for-idle` | Wait until one session becomes idle. |
+| `wait-for-idle` | Wait until one session and its child agents become idle. |
 | `wait-any` | Wait until the first of multiple sessions becomes idle. |
 | `wait-all` | Wait until all listed sessions become idle. |
-| `is-idle` | Check idle state without blocking. |
+| `is-idle` | Check aggregate idle state without blocking. |
 | `summary` | Print status, todo progress, cost, and the latest output snippet. |
 | `worktree`, `wt` | Manage git worktrees for isolated sessions. |
 | `install-skill` | Install the bundled `occtl` skill for OpenCode-compatible agents. |
