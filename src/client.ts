@@ -1,4 +1,4 @@
-import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk";
+import { createOpencodeClient, type OpencodeClient, type Session } from "@opencode-ai/sdk";
 import {
   createOpencodeClient as createOpencodeClientV2,
   type OpencodeClient as OpencodeClientV2,
@@ -120,6 +120,35 @@ export function getClientV2(): OpencodeClientV2 {
     });
   }
   return _clientV2;
+}
+
+/**
+ * List sessions, transparently bypassing the OpenCode server's default
+ * 100-row response cap. The server respects an explicit `limit` query
+ * parameter (even though the v1 SDK type does not advertise it), so we
+ * request a generous batch and grow it if the server returns exactly the
+ * limit — which is the only signal we have that more rows may exist
+ * (the v1 endpoint has no cursor).
+ *
+ * Pass `directory` to scope to one project, or omit for the server-wide
+ * unfiltered view.
+ */
+export async function listAllSessions(
+  client: OpencodeClient,
+  filter: { directory?: string } = {}
+): Promise<Session[]> {
+  const seen = new Map<string, Session>();
+  let limit = 1000;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const result = await client.session.list({
+      query: { ...filter, limit } as { directory?: string },
+    });
+    const data = result.data ?? [];
+    for (const s of data) seen.set(s.id, s);
+    if (data.length < limit) break;
+    limit *= 4;
+  }
+  return Array.from(seen.values());
 }
 
 export async function ensureServer(): Promise<OpencodeClient> {

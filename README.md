@@ -241,7 +241,7 @@ The password is sent with HTTP Basic authentication using the `opencode` usernam
 | Command | Purpose |
 | --- | --- |
 | `ping` | Check that an OpenCode server is reachable. |
-| `list`, `ls` | List sessions for the current directory, another directory, or all directories. |
+| `list`, `ls` | List sessions for the current directory, another directory, or all directories. The OpenCode server caps each response at 100 rows; occtl pages transparently so `--all` returns every session the server lists. Use `status` to enumerate every session that has a status entry, including ones the server omits from the listing. |
 | `create`, `new` | Create a session and optionally store model defaults. |
 | `delete`, `rm` | Delete a session and remove its stored defaults. |
 | `get`, `show` | Show session details and stored defaults. |

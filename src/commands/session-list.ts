@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import path from "path";
-import { ensureServer } from "../client.js";
+import { ensureServer, listAllSessions } from "../client.js";
 import { formatSession, formatSessionDetailed, formatJSON } from "../format.js";
 import { listStoredSessionIds, readDefaults } from "../session-defaults.js";
 import { deriveSessionStatus } from "../status-util.js";
@@ -10,7 +10,7 @@ export function sessionListCommand(): Command {
   return new Command("list")
     .alias("ls")
     .description(
-      "List sessions. Default: current directory only. Pass a path to filter by directory, or --all for everything."
+      "List sessions. Default: current directory only. Pass a path to filter by directory, or --all for everything. The OpenCode server caps each response at 100 rows; occtl pages internally so --all returns every session the server lists."
     )
     .argument("[directory]", "Only show sessions for this directory")
     .option("-j, --json", "Output as JSON")
@@ -38,8 +38,8 @@ export function sessionListCommand(): Command {
 
       if (opts.orphans) {
         const stored = listStoredSessionIds();
-        const allLive = await client.session.list({});
-        const liveIds = new Set((allLive.data ?? []).map((s) => s.id));
+        const allLive = await listAllSessions(client);
+        const liveIds = new Set(allLive.map((s) => s.id));
         const orphans = stored.filter((id) => !liveIds.has(id));
 
         if (opts.json) {
@@ -78,12 +78,13 @@ export function sessionListCommand(): Command {
         filterDir = process.cwd();
       }
 
-      const result = await client.session.list({
-        ...(filterDir && { query: { directory: filterDir } }),
-      });
-      let sessions = result.data ?? [];
+      let sessions = await listAllSessions(
+        client,
+        filterDir ? { directory: filterDir } : {}
+      );
 
-      // Client-side directory filtering as fallback
+      // Client-side directory filtering as fallback (the server may return
+      // sessions outside the requested directory when the param is ignored).
       if (filterDir) {
         sessions = sessions.filter((s) => s.directory === filterDir);
       }
@@ -95,12 +96,11 @@ export function sessionListCommand(): Command {
 
       // Filter to non-idle sessions if --active
       if (opts.active) {
-        const [statusResult, allSessionsResult] = await Promise.all([
+        const [statusResult, allSessions] = await Promise.all([
           client.session.status(),
-          client.session.list({}),
+          listAllSessions(client),
         ]);
         const statuses = statusResult.data ?? {};
-        const allSessions = allSessionsResult.data ?? [];
         sessions = sessions.filter((s) => {
           const status = statuses[s.id];
           if (opts.mainAgent) return status && status.type !== "idle";

@@ -1,4 +1,5 @@
 import type { OpencodeClient, Session } from "@opencode-ai/sdk";
+import { listAllSessions } from "./client.js";
 
 type SessionStatus = {
   type: string;
@@ -54,16 +55,12 @@ export async function getDerivedSessionStatus(
   client: OpencodeClient,
   sessionId: string
 ): Promise<DerivedSessionStatus> {
-  const [statusResult, sessionsResult] = await Promise.all([
+  const [statusResult, sessions] = await Promise.all([
     client.session.status(),
-    client.session.list({}),
+    listAllSessions(client),
   ]);
 
-  return deriveSessionStatus(
-    sessionId,
-    statusResult.data ?? {},
-    sessionsResult.data ?? []
-  );
+  return deriveSessionStatus(sessionId, statusResult.data ?? {}, sessions);
 }
 
 function getDescendantIds(sessionId: string, sessions: Session[]): string[] {
