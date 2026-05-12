@@ -226,7 +226,12 @@ occtl rm "$SID" --keep-defaults
 
 ## Server configuration
 
-`occtl` tries to detect a running OpenCode server by inspecting local processes. Set environment variables when auto-detection is not enough:
+`occtl` tries to detect a running OpenCode server by inspecting local processes. Use `--attach host:port` for a specific server, or set environment variables when auto-detection is not enough:
+
+```bash
+occtl --attach seamus:4095 list --all
+occtl ping --attach 127.0.0.1:4096
+```
 
 ```bash
 export OPENCODE_SERVER_HOST=127.0.0.1

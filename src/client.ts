@@ -161,7 +161,7 @@ export async function ensureServer(): Promise<OpencodeClient> {
       "Error: Cannot connect to OpenCode server at " + getBaseUrl()
     );
     console.error(
-      "Make sure OpenCode is running, or set OPENCODE_SERVER_HOST/OPENCODE_SERVER_PORT"
+      "Make sure OpenCode is running, use --attach host:port, or set OPENCODE_SERVER_HOST/OPENCODE_SERVER_PORT"
     );
     process.exit(1);
   }
