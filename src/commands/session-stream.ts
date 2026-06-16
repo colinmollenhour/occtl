@@ -1,9 +1,19 @@
 import { Command } from "commander";
+import type { OpencodeClient } from "@opencode-ai/sdk";
 import { ensureServer, getClientV2 } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import { readDefaults } from "../session-defaults.js";
-import { startStream } from "../sse.js";
+import { startStream, type StreamHandle } from "../sse.js";
 import { handleEvent } from "./session-watch.js";
+
+type StreamIdleReason = "sse" | "api" | "timeout" | "disconnected";
+
+// After promptAsync resolves, wait this long before the API fallback poll may
+// declare idle without having observed the session go busy. Covers turns that
+// finish faster than a poll can observe busy, and servers that never emit
+// session.idle / session.status at all (the original hang bug).
+const IDLE_GRACE_MS = 3000;
+const POLL_INTERVAL_MS = 2000;
 
 export function sessionStreamCommand(): Command {
   return new Command("stream")
@@ -18,7 +28,23 @@ export function sessionStreamCommand(): Command {
     .option("--model <model>", "Model to use (format: provider/model)")
     .option("--variant <variant>", "Model variant to use (e.g. high)")
     .option("--stdin", "Read message from stdin instead of arguments")
+    .option(
+      "-t, --timeout <seconds>",
+      "Exit 124 if the session is still busy after this many seconds. " +
+        "Bound long runs and fall back to `occtl last` for the result.",
+      parseInt
+    )
     .action(async (messageParts: string[] | undefined, opts) => {
+      // Validate CLI args before contacting the server (fail fast).
+      let timeoutMs = 0;
+      if (opts.timeout !== undefined) {
+        timeoutMs = Number(opts.timeout) * 1000;
+        if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+          console.error("--timeout must be a non-negative number of seconds.");
+          process.exit(2);
+        }
+      }
+
       const client = await ensureServer();
       const clientV2 = getClientV2();
       const resolved = await resolveSession(client, opts.session);
@@ -52,33 +78,232 @@ export function sessionStreamCommand(): Command {
         }
       }
 
-      // Open SSE first so we don't miss early events.
-      const handle = startStream(resolved, (event) => {
-        if (opts.json) {
-          process.stdout.write(JSON.stringify(event) + "\n");
-        } else {
-          handleEvent(event);
-        }
-        if (event.type === "session.idle") {
-          return "stop";
-        }
+      const noReply = opts.reply === false;
+
+      const reason = await runStream({
+        client,
+        clientV2,
+        sessionId: resolved,
+        messageText,
+        model,
+        agent,
+        variant,
+        noReply,
+        json: !!opts.json,
+        timeoutMs,
       });
 
-      await handle.connected;
-
-      await clientV2.session.promptAsync({
-        sessionID: resolved,
-        parts: [{ type: "text", text: messageText }],
-        ...(model && { model }),
-        ...(agent && { agent }),
-        ...(variant && { variant }),
-        ...(opts.reply === false && { noReply: true }),
-      });
-
-      const result = await handle.result;
-      if (result === "disconnected") {
+      if (reason === "timeout") {
+        // Diagnostics go to stderr so --json stdout stays valid NDJSON.
+        console.error(
+          `\nocctl stream: timed out after ${opts.timeout} second(s). ` +
+            `The session may still be running — read the result with \`occtl last ${resolved}\`.`
+        );
+        process.exit(124);
+      }
+      if (reason === "disconnected") {
         console.error("\nLost connection to OpenCode server.");
         process.exit(1);
       }
     });
+}
+
+interface RunStreamArgs {
+  client: OpencodeClient;
+  clientV2: ReturnType<typeof getClientV2>;
+  sessionId: string;
+  messageText: string;
+  model?: { providerID: string; modelID: string };
+  agent?: string;
+  variant?: string;
+  noReply: boolean;
+  json: boolean;
+  timeoutMs: number;
+}
+
+/**
+ * Send a message and stream events until the session is idle.
+ *
+ * Idle is detected via any of:
+ *   - `session.idle` SSE event (authoritative: we subscribe before sending, so
+ *     it cannot be stale from a prior turn),
+ *   - `session.status` SSE event with type "idle", but only after the session
+ *     has been observed busy (avoids exiting on a pre-turn idle snapshot),
+ *   - periodic `client.session.status()` API poll, gated the same way plus a
+ *     short grace period, so a missed/never-emitted terminal SSE event can
+ *     never hang the command (the original bug).
+ *
+ * The detector owns its own settled/reason state. `handle.cancel()` resolves
+ * the underlying SSE handle as "disconnected", so we must NOT treat a
+ * self-induced cancel as a lost connection — only an unsolicited disconnect
+ * (stream ended on its own while not settled) is reported as "disconnected".
+ */
+async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
+  const {
+    client,
+    clientV2,
+    sessionId,
+    messageText,
+    model,
+    agent,
+    variant,
+    noReply,
+    json,
+    timeoutMs,
+  } = args;
+
+  const state: {
+    handle: StreamHandle | undefined;
+    settled: boolean;
+    sawBusy: boolean;
+    polling: boolean;
+    promptResolvedAt: number;
+    pollTimer: ReturnType<typeof setInterval> | undefined;
+    hardTimer: ReturnType<typeof setTimeout> | undefined;
+  } = {
+    handle: undefined,
+    settled: false,
+    sawBusy: false,
+    polling: false,
+    promptResolvedAt: 0,
+    pollTimer: undefined,
+    hardTimer: undefined,
+  };
+
+  let resolveReason!: (r: StreamIdleReason) => void;
+  const done = new Promise<StreamIdleReason>((resolve) => {
+    resolveReason = resolve;
+  });
+
+  // Forward declaration so settle/cleanup can detach the signal handlers.
+  let onSignal: (sig: NodeJS.Signals) => void = () => {};
+
+  const idleEligible = (): boolean =>
+    state.sawBusy ||
+    noReply ||
+    (state.promptResolvedAt > 0 &&
+      Date.now() - state.promptResolvedAt >= IDLE_GRACE_MS);
+
+  const cleanup = (): void => {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    if (state.hardTimer) clearTimeout(state.hardTimer);
+    state.handle?.cancel();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  };
+
+  const settle = (reason: StreamIdleReason): void => {
+    if (state.settled) return;
+    state.settled = true;
+    cleanup();
+    resolveReason(reason);
+  };
+
+  // One raw status check. Sets sawBusy if the turn has started; settles on idle
+  // only once idle-eligible. Used both as an immediate post-prompt probe and as
+  // the periodic fallback. Guards against overlapping calls on slow APIs.
+  const probeStatus = async (): Promise<void> => {
+    if (state.settled || state.polling) return;
+    state.polling = true;
+    try {
+      const statusResult = await client.session.status();
+      const statuses = statusResult.data ?? {};
+      const type = statuses[sessionId]?.type;
+      if (type === "busy" || type === "retry") {
+        state.sawBusy = true;
+        return;
+      }
+      // idle, or no status entry yet — only terminal if eligible.
+      if (idleEligible()) settle("api");
+    } catch {
+      // API check failed; rely on SSE events and later polls.
+    } finally {
+      state.polling = false;
+    }
+  };
+
+  // Open SSE first so we don't miss the busy→idle transition.
+  state.handle = startStream(sessionId, (event) => {
+    if (json) {
+      process.stdout.write(JSON.stringify(event) + "\n");
+    } else {
+      handleEvent(event);
+    }
+    switch (event.type) {
+      case "session.idle":
+        // Authoritative terminal signal (we subscribed before sending).
+        settle("sse");
+        return "stop";
+      case "session.status": {
+        const props = event.properties as { status?: { type?: string } };
+        const type = props.status?.type;
+        if (type === "busy" || type === "retry") {
+          state.sawBusy = true;
+        } else if (type === "idle" && idleEligible()) {
+          // A status snapshot may reflect pre-turn idle; only stop once the
+          // turn has actually started (or the grace backstop has elapsed).
+          settle("sse");
+          return "stop";
+        }
+        break;
+      }
+      case "message.updated":
+      case "message.part.updated":
+        // The turn is producing output, so a later idle is a genuine finish.
+        state.sawBusy = true;
+        break;
+      default:
+        break;
+    }
+    return;
+  });
+
+  // Unsolicited stream end ⇒ lost connection. A self-induced cancel (from
+  // settle) resolves as "disconnected" too, but by then state.settled is true.
+  state.handle.result.then((streamResult) => {
+    if (!state.settled && streamResult === "disconnected") settle("disconnected");
+  });
+
+  if (timeoutMs > 0) {
+    state.hardTimer = setTimeout(() => settle("timeout"), timeoutMs);
+  }
+
+  // Tear down cleanly on interrupt so timers/SSE don't linger.
+  onSignal = (sig: NodeJS.Signals): void => {
+    settle("disconnected");
+    process.exit(sig === "SIGINT" ? 130 : 143);
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
+  await state.handle.connected;
+  // If a timeout/signal fired while connecting, stop without sending.
+  if (state.settled) return done;
+
+  try {
+    await clientV2.session.promptAsync({
+      sessionID: sessionId,
+      parts: [{ type: "text", text: messageText }],
+      ...(model && { model }),
+      ...(agent && { agent }),
+      ...(variant && { variant }),
+      ...(noReply && { noReply: true }),
+    });
+  } catch (err) {
+    // promptAsync failed (auth/Network/400). Clean up timers/SSE, then surface
+    // the real error rather than masking it as "lost connection".
+    cleanup();
+    throw err;
+  }
+  state.promptResolvedAt = Date.now();
+
+  // Immediate probe fast-paths sawBusy if the server is already busy.
+  await probeStatus();
+
+  // Periodic fallback in case the terminal SSE event is missed or never sent.
+  state.pollTimer = setInterval(() => {
+    void probeStatus();
+  }, POLL_INTERVAL_MS);
+
+  return done;
 }
