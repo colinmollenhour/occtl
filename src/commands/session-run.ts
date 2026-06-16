@@ -261,8 +261,10 @@ async function runAction(positionalParts: string[], opts: RunOpts): Promise<void
     }
 
     // ─── Use the completed assistant message ──────────────────────────────
-    const message = turn.message!;
-    const parts = turn.parts ?? [];
+    // `turn` is narrowed to the "completed" variant here (the block above exits
+    // for every other status), so `message`/`parts` are guaranteed present.
+    const message = turn.message;
+    const parts = turn.parts;
     const text = extractText(parts);
 
     // ─── Write outputs ────────────────────────────────────────────────────

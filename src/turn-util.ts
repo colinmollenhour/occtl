@@ -1,18 +1,28 @@
 import type { OpencodeClient, AssistantMessage, Part } from "@opencode-ai/sdk";
 
 /**
- * Outcome of waiting for a submitted prompt's turn to finish.
+ * Some opencode server versions cap `session.messages` at ~100 rows unless an
+ * explicit `limit` is given (the v1 SDK type does not advertise the param, but
+ * the server honors it — same trick as `listAllSessions`). Without it, a long
+ * session could return a page that omits the newest assistant message and the
+ * wait would never settle. opencode 1.17.7 returns the full history regardless,
+ * so this is defensive insurance across server versions.
+ */
+const MESSAGES_LIMIT = 100000;
+
+/**
+ * Outcome of waiting for a submitted prompt's turn to finish. Modeled as a
+ * discriminated union so `message`/`parts` are guaranteed present exactly when
+ * `status === "completed"`.
  *  - "completed":    the turn's assistant message exists and is finalized
- *                    (`time.completed` set, or a terminal `error`). `message`
- *                    and `parts` are populated.
+ *                    (`time.completed` set, or a terminal `error`).
  *  - "timeout":      the deadline elapsed first.
  *  - "disconnected": the server became unreachable / the wait was aborted.
  */
-export interface TurnResult {
-  status: "completed" | "timeout" | "disconnected";
-  message?: AssistantMessage;
-  parts?: Part[];
-}
+export type TurnResult =
+  | { status: "completed"; message: AssistantMessage; parts: Part[] }
+  | { status: "timeout" }
+  | { status: "disconnected" };
 
 export interface WaitTurnOptions {
   /**
@@ -124,7 +134,10 @@ export async function waitForTurnComplete(
       if (signal?.aborted) return { status: "disconnected" };
 
       try {
-        const res = await client.session.messages({ path: { id: sessionId } });
+        const res = await client.session.messages({
+          path: { id: sessionId },
+          query: { limit: MESSAGES_LIMIT },
+        } as Parameters<typeof client.session.messages>[0]);
         const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
         consecutiveErrors = 0;
         const candidate = lastAssistant(envelopes);
@@ -179,7 +192,10 @@ export async function snapshotAssistantIds(
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await client.session.messages({ path: { id: sessionId } });
+      const res = await client.session.messages({
+        path: { id: sessionId },
+        query: { limit: MESSAGES_LIMIT },
+      } as Parameters<typeof client.session.messages>[0]);
       const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
       const ids = new Set<string>();
       for (const env of envelopes) {
