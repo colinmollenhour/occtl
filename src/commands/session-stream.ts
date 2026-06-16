@@ -31,18 +31,20 @@ export function sessionStreamCommand(): Command {
     .option(
       "-t, --timeout <seconds>",
       "Exit 124 if the session is still busy after this many seconds. " +
-        "Bound long runs and fall back to `occtl last` for the result.",
-      parseInt
+        "Bound long runs and fall back to `occtl last` for the result."
     )
     .action(async (messageParts: string[] | undefined, opts) => {
-      // Validate CLI args before contacting the server (fail fast).
+      // Validate CLI args before contacting the server (fail fast). Parse the
+      // raw string with Number() so partial/invalid input ("10abc", "abc") is
+      // rejected rather than silently coerced by parseInt.
       let timeoutMs = 0;
       if (opts.timeout !== undefined) {
-        timeoutMs = Number(opts.timeout) * 1000;
-        if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        const timeoutSeconds = Number(opts.timeout);
+        if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
           console.error("--timeout must be a non-negative number of seconds.");
           process.exit(2);
         }
+        timeoutMs = timeoutSeconds * 1000;
       }
 
       const client = await ensureServer();
@@ -276,29 +278,44 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
-  await state.handle.connected;
-  // If a timeout/signal fired while connecting, stop without sending.
+  // Race each await against `done` so a --timeout / signal / unsolicited
+  // disconnect (any of which calls settle() and resolves `done`) can
+  // short-circuit promptly even if the awaited operation is still in flight.
+  await Promise.race([state.handle.connected, done]);
+  // If a timeout/signal/disconnect fired while connecting, stop without sending.
   if (state.settled) return done;
 
+  const promptP = clientV2.session.promptAsync({
+    sessionID: sessionId,
+    parts: [{ type: "text", text: messageText }],
+    ...(model && { model }),
+    ...(agent && { agent }),
+    ...(variant && { variant }),
+    ...(noReply && { noReply: true }),
+  });
   try {
-    await clientV2.session.promptAsync({
-      sessionID: sessionId,
-      parts: [{ type: "text", text: messageText }],
-      ...(model && { model }),
-      ...(agent && { agent }),
-      ...(variant && { variant }),
-      ...(noReply && { noReply: true }),
-    });
+    await Promise.race([promptP, done]);
   } catch (err) {
     // promptAsync failed (auth/Network/400). Clean up timers/SSE, then surface
     // the real error rather than masking it as "lost connection".
     cleanup();
     throw err;
   }
+  if (state.settled) {
+    // Settled while promptAsync was still in flight; swallow any late rejection
+    // so it doesn't surface as an unhandled promise rejection after we return.
+    promptP.catch(() => {});
+    return done;
+  }
   state.promptResolvedAt = Date.now();
 
   // Immediate probe fast-paths sawBusy if the server is already busy.
-  await probeStatus();
+  await Promise.race([probeStatus(), done]);
+  if (state.settled) {
+    // The probe settled (e.g. --no-reply with the session already idle): do not
+    // arm the periodic poller (cleanup() already ran).
+    return done;
+  }
 
   // Periodic fallback in case the terminal SSE event is missed or never sent.
   state.pollTimer = setInterval(() => {
