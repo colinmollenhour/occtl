@@ -82,13 +82,17 @@ occtl stream "long task" --timeout 1800         # exit 124 if not idle in 1800s,
 occtl stream "spawn sub-agents" --wait-children # also wait for sub-agents to finish
 ```
 
-`stream` exits 0 when the session goes idle. It detects idle from the
-`session.idle`/`session.status` SSE events plus a periodic status API fallback,
-so it returns reliably even if the server never emits a terminal event. A
-pre-turn idle state never exits early (it waits for an observed busy→idle
-transition, or a short grace). `--timeout <seconds>` exits 124 if the session is
-still busy after the deadline; read the result with `occtl last`. Diagnostics
-always go to stderr, so `--json` stdout stays valid NDJSON.
+`stream` exits 0 once the turn it submitted has finished. It detects completion
+by polling `session.messages` for a **new** assistant message that the server has
+finalized (`time.completed`, or a terminal error), keyed off a snapshot taken
+before the prompt is sent. This is robust regardless of whether the server emits
+`session.idle`/`session.status` SSE events (some versions emit none): a fresh or
+idle session can never look "already done" (no new message exists yet), and a
+missed terminal event can never wedge the command. The live SSE stream is still
+used for best-effort display and only *accelerates* the poll. `--timeout
+<seconds>` exits 124 if the turn has not finished by the deadline; read the
+result with `occtl last`. Diagnostics always go to stderr, so `--json` stdout
+stays valid NDJSON.
 
 By default `stream` tracks only the main agent (its own behavior, and the
 cheapest poll). Pass `--wait-children` to stay until sub-agent (child) sessions
