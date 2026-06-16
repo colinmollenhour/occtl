@@ -227,22 +227,26 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
     if (state.settled || state.polling) return;
     state.polling = true;
     try {
-      let busy: boolean;
       if (waitChildren) {
         const derived = await getDerivedSessionStatus(client, sessionId);
-        busy = !derived.allIdle;
+        // sawBusy is the eligibility gate — it must track the MAIN agent's
+        // turn starting, NOT descendant activity. A pre-existing background
+        // child would otherwise mark sawBusy before this prompt's turn begins,
+        // letting a later all-idle snapshot settle pre-turn idle.
+        if (!derived.mainIdle) state.sawBusy = true;
+        // Exit only when the whole tree (main + sub-agents) is idle.
+        if (derived.allIdle && idleEligible()) settle("api");
       } else {
         const statusResult = await client.session.status();
         const statuses = statusResult.data ?? {};
         const type = statuses[sessionId]?.type;
-        busy = type === "busy" || type === "retry";
+        if (type === "busy" || type === "retry") {
+          state.sawBusy = true;
+        } else if (idleEligible()) {
+          // idle, or no status entry yet — only terminal if eligible.
+          settle("api");
+        }
       }
-      if (busy) {
-        state.sawBusy = true;
-        return;
-      }
-      // idle (whole tree, when waitChildren) — only terminal if eligible.
-      if (idleEligible()) settle("api");
     } catch {
       // API check failed; rely on SSE events and later polls.
     } finally {
