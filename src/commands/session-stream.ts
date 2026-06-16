@@ -4,6 +4,7 @@ import { ensureServer, getClientV2 } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import { readDefaults } from "../session-defaults.js";
 import { startStream, type StreamHandle } from "../sse.js";
+import { getDerivedSessionStatus } from "../status-util.js";
 import { handleEvent } from "./session-watch.js";
 
 type StreamIdleReason = "sse" | "api" | "timeout" | "disconnected";
@@ -33,6 +34,11 @@ export function sessionStreamCommand(): Command {
       "Exit 124 if the session is still busy after this many seconds. " +
         "Bound long runs and fall back to `occtl last` for the result.",
       parseInt
+    )
+    .option(
+      "--wait-children",
+      "Stay until sub-agent (child) sessions are also idle, not just the main " +
+        "agent. Matches the tree-aware idle semantics of `wait-for-idle`/`is-idle`."
     )
     .action(async (messageParts: string[] | undefined, opts) => {
       // Validate CLI args before contacting the server (fail fast).
@@ -91,6 +97,7 @@ export function sessionStreamCommand(): Command {
         noReply,
         json: !!opts.json,
         timeoutMs,
+        waitChildren: !!opts.waitChildren,
       });
 
       if (reason === "timeout") {
@@ -119,6 +126,7 @@ interface RunStreamArgs {
   noReply: boolean;
   json: boolean;
   timeoutMs: number;
+  waitChildren: boolean;
 }
 
 /**
@@ -132,6 +140,14 @@ interface RunStreamArgs {
  *   - periodic `client.session.status()` API poll, gated the same way plus a
  *     short grace period, so a missed/never-emitted terminal SSE event can
  *     never hang the command (the original bug).
+ *
+ * Detection is main-agent-only by default (matching the original `stream`
+ * behavior and avoiding the `listAllSessions` tree walk). With `waitChildren`,
+ * idle is instead derived from the whole session tree (`getDerivedSessionStatus`),
+ * so it waits for sub-agents too. In that mode the terminal SSE events only
+ * *trigger* a tree re-check rather than settling directly, because child
+ * sessions are not delivered on this single-session stream — the API poll is
+ * the authority for "all sub-agents idle".
  *
  * The detector owns its own settled/reason state. `handle.cancel()` resolves
  * the underlying SSE handle as "disconnected", so we must NOT treat a
@@ -150,6 +166,7 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
     noReply,
     json,
     timeoutMs,
+    waitChildren,
   } = args;
 
   const state: {
@@ -199,21 +216,32 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
     resolveReason(reason);
   };
 
-  // One raw status check. Sets sawBusy if the turn has started; settles on idle
+  // One status check. Sets sawBusy if the turn has started; settles on idle
   // only once idle-eligible. Used both as an immediate post-prompt probe and as
   // the periodic fallback. Guards against overlapping calls on slow APIs.
+  //
+  // Default: raw `session.status()` for the target session (main-agent-only).
+  // With waitChildren: tree-aware `getDerivedSessionStatus`, so "idle" requires
+  // the main agent and every sub-agent to be idle.
   const probeStatus = async (): Promise<void> => {
     if (state.settled || state.polling) return;
     state.polling = true;
     try {
-      const statusResult = await client.session.status();
-      const statuses = statusResult.data ?? {};
-      const type = statuses[sessionId]?.type;
-      if (type === "busy" || type === "retry") {
+      let busy: boolean;
+      if (waitChildren) {
+        const derived = await getDerivedSessionStatus(client, sessionId);
+        busy = !derived.allIdle;
+      } else {
+        const statusResult = await client.session.status();
+        const statuses = statusResult.data ?? {};
+        const type = statuses[sessionId]?.type;
+        busy = type === "busy" || type === "retry";
+      }
+      if (busy) {
         state.sawBusy = true;
         return;
       }
-      // idle, or no status entry yet — only terminal if eligible.
+      // idle (whole tree, when waitChildren) — only terminal if eligible.
       if (idleEligible()) settle("api");
     } catch {
       // API check failed; rely on SSE events and later polls.
@@ -231,19 +259,31 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
     }
     switch (event.type) {
       case "session.idle":
-        // Authoritative terminal signal (we subscribed before sending).
-        settle("sse");
-        return "stop";
+        // Authoritative terminal signal for the MAIN agent (we subscribed
+        // before sending). With --wait-children, sub-agents may still be
+        // running and their events are not delivered on this single-session
+        // stream, so re-check the whole tree via the API instead of stopping.
+        if (waitChildren) {
+          void probeStatus();
+        } else {
+          settle("sse");
+          return "stop";
+        }
+        break;
       case "session.status": {
         const props = event.properties as { status?: { type?: string } };
         const type = props.status?.type;
         if (type === "busy" || type === "retry") {
           state.sawBusy = true;
-        } else if (type === "idle" && idleEligible()) {
-          // A status snapshot may reflect pre-turn idle; only stop once the
+        } else if (type === "idle") {
+          // A status snapshot may reflect pre-turn idle; only act once the
           // turn has actually started (or the grace backstop has elapsed).
-          settle("sse");
-          return "stop";
+          if (waitChildren) {
+            void probeStatus();
+          } else if (idleEligible()) {
+            settle("sse");
+            return "stop";
+          }
         }
         break;
       }
