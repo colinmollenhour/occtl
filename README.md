@@ -78,7 +78,14 @@ occtl send --wait "update the docs"             # send, wait until idle, and pri
 occtl send --stdin < prompt.md                  # read the prompt from stdin
 occtl stream "implement the parser"             # stream tool calls and text until idle
 occtl stream --json "run verification"          # newline-delimited JSON events
+occtl stream --timeout 1800 "do the thing"      # bound the wait; exit 124 if not idle in time
 ```
+
+`stream` exits when the session (and any sub-agents) returns to idle. It backs the
+`session.idle` event with a periodic API status check, so a dropped or missing idle event no
+longer leaves it hanging. `--timeout <seconds>` sets a hard deadline and `--idle-timeout
+<seconds>` exits when no new events arrive for that long; both stop streaming and exit 124, so
+a caller can fall back to `occtl last` to read the (already-generated) result.
 
 Use `stream` or `send --wait` for single-session automation. `status`, `summary`, `list --active`, `wait-for-idle`, and `is-idle` treat a parent session with active sub-agents as `waiting`, not idle. Pass `--main-agent` when you specifically want the parent agent's own status. If you use `send --async` and then poll, pass `--require-busy` to `wait-for-idle`, `wait-all`, or `is-idle` so a fresh session does not appear idle before the prompt starts.
 
@@ -257,7 +264,7 @@ When `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, or `https_proxy` is set, occtl r
 | `status` | Show idle, waiting, busy, and retry status. |
 | `watch` | Watch real-time session events. |
 | `send`, `prompt` | Send a message to a session. |
-| `stream` | Send a message and stream events until the session becomes idle. |
+| `stream` | Send a message and stream events until the session becomes idle (`--timeout`/`--idle-timeout` bound the wait, exit 124). |
 | `run` | Run a one-shot prompt in a new session. |
 | `respond` | Respond to permission requests. |
 | `models` | List providers, models, and variants from OpenCode configuration. |
