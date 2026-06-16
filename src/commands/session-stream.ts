@@ -5,16 +5,16 @@ import { resolveSession } from "../resolve.js";
 import { readDefaults } from "../session-defaults.js";
 import { startStream, type StreamHandle } from "../sse.js";
 import { getDerivedSessionStatus } from "../status-util.js";
+import { snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
 import { handleEvent } from "./session-watch.js";
 
-type StreamIdleReason = "sse" | "api" | "timeout" | "disconnected";
+type StreamExitReason = "completed" | "timeout" | "disconnected";
 
-// After promptAsync resolves, wait this long before the API fallback poll may
-// declare idle without having observed the session go busy. Covers turns that
-// finish faster than a poll can observe busy, and servers that never emit
-// session.idle / session.status at all (the original hang bug).
-const IDLE_GRACE_MS = 3000;
-const POLL_INTERVAL_MS = 2000;
+// Steady-state cadence of the message-completion poll (the SSE stream pokes it
+// to re-check sooner when the server does emit events).
+const POLL_INTERVAL_MS = 1500;
+// How often to re-check the session tree while waiting for sub-agents.
+const CHILD_POLL_INTERVAL_MS = 1500;
 
 export function sessionStreamCommand(): Command {
   return new Command("stream")
@@ -88,19 +88,30 @@ export function sessionStreamCommand(): Command {
 
       const noReply = opts.reply === false;
 
-      const reason = await runStream({
-        client,
-        clientV2,
-        sessionId: resolved,
-        messageText,
-        model,
-        agent,
-        variant,
-        noReply,
-        json: !!opts.json,
-        timeoutMs,
-        waitChildren: !!opts.waitChildren,
-      });
+      let reason: StreamExitReason;
+      try {
+        reason = await runStream({
+          client,
+          clientV2,
+          sessionId: resolved,
+          messageText,
+          model,
+          agent,
+          variant,
+          noReply,
+          json: !!opts.json,
+          timeoutMs,
+          waitChildren: !!opts.waitChildren,
+        });
+      } catch (err) {
+        // Startup failure (server unreachable during snapshot / promptAsync
+        // auth/4xx). Surface it cleanly with exit 1 — parity with `run` — rather
+        // than as a raw unhandled rejection.
+        console.error(
+          `\nocctl stream: ${err instanceof Error ? err.message : String(err)}`
+        );
+        process.exit(1);
+      }
 
       if (reason === "timeout") {
         // Diagnostics go to stderr so --json stdout stays valid NDJSON.
@@ -132,31 +143,28 @@ interface RunStreamArgs {
 }
 
 /**
- * Send a message and stream events until the session is idle.
+ * Send a message, stream events live for display, and return once the submitted
+ * turn has actually completed.
  *
- * Idle is detected via any of:
- *   - `session.idle` SSE event (authoritative: we subscribe before sending, so
- *     it cannot be stale from a prior turn),
- *   - `session.status` SSE event with type "idle", but only after the session
- *     has been observed busy (avoids exiting on a pre-turn idle snapshot),
- *   - periodic `client.session.status()` API poll, gated the same way plus a
- *     short grace period, so a missed/never-emitted terminal SSE event can
- *     never hang the command (the original bug).
+ * Completion is detected by polling `session.messages` for a NEW assistant
+ * message that the server has finalized (`time.completed`/`error`) — see
+ * `waitForTurnComplete`. This is the only signal that is reliable across
+ * opencode server versions: some never deliver `session.idle`/`session.status`
+ * SSE events for a session, and `session.status()` can report a busy session as
+ * absent. The SSE stream here is therefore best-effort: it renders live output
+ * and *pokes* the poller to re-check sooner, but it never decides completion.
  *
- * Detection is main-agent-only by default (matching the original `stream`
- * behavior and avoiding the `listAllSessions` tree walk). With `waitChildren`,
- * idle is instead derived from the whole session tree (`getDerivedSessionStatus`),
- * so it waits for sub-agents too. In that mode the terminal SSE events only
- * *trigger* a tree re-check rather than settling directly, because child
- * sessions are not delivered on this single-session stream — the API poll is
- * the authority for "all sub-agents idle".
+ * This fixes two regressions:
+ *  - the premature empty exit (a pre-send snapshot means a fresh/idle session
+ *    can never look "already complete"), and
+ *  - the original hang (message state is polled, so a missed terminal SSE event
+ *    cannot wedge the command).
  *
- * The detector owns its own settled/reason state. `handle.cancel()` resolves
- * the underlying SSE handle as "disconnected", so we must NOT treat a
- * self-induced cancel as a lost connection — only an unsolicited disconnect
- * (stream ended on its own while not settled) is reported as "disconnected".
+ * `--wait-children` waits for the main turn to finish, then polls the session
+ * tree until every sub-agent is idle too. `--timeout` bounds the whole wait and
+ * exits 124 without aborting (so the caller can recover via `occtl last`).
  */
-async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
+async function runStream(args: RunStreamArgs): Promise<StreamExitReason> {
   const {
     client,
     clientV2,
@@ -171,200 +179,174 @@ async function runStream(args: RunStreamArgs): Promise<StreamIdleReason> {
     waitChildren,
   } = args;
 
-  const state: {
-    handle: StreamHandle | undefined;
-    settled: boolean;
-    sawBusy: boolean;
-    polling: boolean;
-    promptResolvedAt: number;
-    pollTimer: ReturnType<typeof setInterval> | undefined;
-    hardTimer: ReturnType<typeof setTimeout> | undefined;
-  } = {
-    handle: undefined,
-    settled: false,
-    sawBusy: false,
-    polling: false,
-    promptResolvedAt: 0,
-    pollTimer: undefined,
-    hardTimer: undefined,
-  };
+  const abort = new AbortController();
+  let poke: (() => void) | undefined;
+  let handle: StreamHandle | undefined;
 
-  let resolveReason!: (r: StreamIdleReason) => void;
-  const done = new Promise<StreamIdleReason>((resolve) => {
-    resolveReason = resolve;
-  });
+  // `--timeout` arms a single deadline that bounds the ENTIRE operation —
+  // SSE connect, the pre-send snapshot, `promptAsync`, and the completion wait —
+  // so a stalled connection or hung request can never outlive the requested
+  // budget. Firing it aborts every in-flight step; `timedOut` distinguishes a
+  // deadline abort (exit 124) from a SIGINT/disconnect abort.
+  let timedOut = false;
+  const hardTimer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          abort.abort();
+        }, timeoutMs)
+      : undefined;
 
-  // Forward declaration so settle/cleanup can detach the signal handlers.
-  let onSignal: (sig: NodeJS.Signals) => void = () => {};
-
-  const idleEligible = (): boolean =>
-    state.sawBusy ||
-    noReply ||
-    (state.promptResolvedAt > 0 &&
-      Date.now() - state.promptResolvedAt >= IDLE_GRACE_MS);
-
-  const cleanup = (): void => {
-    if (state.pollTimer) clearInterval(state.pollTimer);
-    if (state.hardTimer) clearTimeout(state.hardTimer);
-    state.handle?.cancel();
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-  };
-
-  const settle = (reason: StreamIdleReason): void => {
-    if (state.settled) return;
-    state.settled = true;
-    cleanup();
-    resolveReason(reason);
-  };
-
-  // One status check. Sets sawBusy if the turn has started; settles on idle
-  // only once idle-eligible. Used both as an immediate post-prompt probe and as
-  // the periodic fallback. Guards against overlapping calls on slow APIs.
-  //
-  // Default: raw `session.status()` for the target session (main-agent-only).
-  // With waitChildren: tree-aware `getDerivedSessionStatus`, so "idle" requires
-  // the main agent and every sub-agent to be idle.
-  const probeStatus = async (): Promise<void> => {
-    if (state.settled || state.polling) return;
-    state.polling = true;
-    try {
-      if (waitChildren) {
-        const derived = await getDerivedSessionStatus(client, sessionId);
-        // sawBusy is the eligibility gate — it must track the MAIN agent's
-        // turn starting, NOT descendant activity. A pre-existing background
-        // child would otherwise mark sawBusy before this prompt's turn begins,
-        // letting a later all-idle snapshot settle pre-turn idle.
-        if (!derived.mainIdle) state.sawBusy = true;
-        // Exit only when the whole tree (main + sub-agents) is idle.
-        if (derived.allIdle && idleEligible()) settle("api");
-      } else {
-        const statusResult = await client.session.status();
-        const statuses = statusResult.data ?? {};
-        const type = statuses[sessionId]?.type;
-        if (type === "busy" || type === "retry") {
-          state.sawBusy = true;
-        } else if (idleEligible()) {
-          // idle, or no status entry yet — only terminal if eligible.
-          settle("api");
-        }
-      }
-    } catch {
-      // API check failed; rely on SSE events and later polls.
-    } finally {
-      state.polling = false;
-    }
-  };
-
-  // Open SSE first so we don't miss the busy→idle transition.
-  state.handle = startStream(sessionId, (event) => {
-    if (json) {
-      process.stdout.write(JSON.stringify(event) + "\n");
-    } else {
-      handleEvent(event);
-    }
-    switch (event.type) {
-      case "session.idle":
-        // Authoritative terminal signal for the MAIN agent (we subscribed
-        // before sending). With --wait-children, sub-agents may still be
-        // running and their events are not delivered on this single-session
-        // stream, so re-check the whole tree via the API instead of stopping.
-        if (waitChildren) {
-          void probeStatus();
-        } else {
-          settle("sse");
-          return "stop";
-        }
-        break;
-      case "session.status": {
-        const props = event.properties as { status?: { type?: string } };
-        const type = props.status?.type;
-        if (type === "busy" || type === "retry") {
-          state.sawBusy = true;
-        } else if (type === "idle") {
-          // A status snapshot may reflect pre-turn idle; only act once the
-          // turn has actually started (or the grace backstop has elapsed).
-          if (waitChildren) {
-            void probeStatus();
-          } else if (idleEligible()) {
-            settle("sse");
-            return "stop";
-          }
-        }
-        break;
-      }
-      case "message.updated":
-      case "message.part.updated":
-        // The turn is producing output, so a later idle is a genuine finish.
-        state.sawBusy = true;
-        break;
-      default:
-        break;
-    }
-    return;
-  });
-
-  // Unsolicited stream end ⇒ lost connection. A self-induced cancel (from
-  // settle) resolves as "disconnected" too, but by then state.settled is true.
-  state.handle.result.then((streamResult) => {
-    if (!state.settled && streamResult === "disconnected") settle("disconnected");
-  });
-
-  if (timeoutMs > 0) {
-    state.hardTimer = setTimeout(() => settle("timeout"), timeoutMs);
-  }
-
-  // Tear down cleanly on interrupt so timers/SSE don't linger.
-  onSignal = (sig: NodeJS.Signals): void => {
-    settle("disconnected");
+  const onSignal = (sig: NodeJS.Signals): void => {
+    abort.abort();
+    handle?.cancel();
     process.exit(sig === "SIGINT" ? 130 : 143);
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
-  // Race each await against `done` so a --timeout / signal / unsolicited
-  // disconnect (any of which calls settle() and resolves `done`) can
-  // short-circuit promptly even if the awaited operation is still in flight.
-  await Promise.race([state.handle.connected, done]);
-  // If a timeout/signal/disconnect fired while connecting, stop without sending.
-  if (state.settled) return done;
+  const finish = (reason: StreamExitReason): StreamExitReason => {
+    if (hardTimer) clearTimeout(hardTimer);
+    handle?.cancel();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    return reason;
+  };
 
-  const promptP = clientV2.session.promptAsync({
-    sessionID: sessionId,
-    parts: [{ type: "text", text: messageText }],
-    ...(model && { model }),
-    ...(agent && { agent }),
-    ...(variant && { variant }),
-    ...(noReply && { noReply: true }),
+  // Resolves (never rejects) the instant the deadline/signal aborts, so we can
+  // race it against connect/snapshot/send without risking an unhandled
+  // rejection if the abort lands after a step already settled.
+  const ABORTED = Symbol("aborted");
+  const abortedP: Promise<typeof ABORTED> = new Promise((resolve) => {
+    if (abort.signal.aborted) resolve(ABORTED);
+    else abort.signal.addEventListener("abort", () => resolve(ABORTED), { once: true });
   });
+  const abortReason = (): StreamExitReason => (timedOut ? "timeout" : "disconnected");
+
+  // Open the SSE stream first (best-effort live display + poll accelerator).
+  handle = startStream(sessionId, (event) => {
+    if (json) {
+      process.stdout.write(JSON.stringify(event) + "\n");
+    } else {
+      handleEvent(event);
+    }
+    // Only genuine terminal/transition hints nudge the poller — NOT per-delta
+    // message events. Poking on `message.part.updated` (per-token) would
+    // collapse the steady 1.5s cadence into a back-to-back full-history
+    // `session.messages()` loop for the whole turn, hammering the server and
+    // risking false `disconnected` exits under load on servers that stream.
+    if (event.type === "session.idle" || event.type === "session.status") {
+      poke?.();
+    }
+  });
+
+  // Wait for the SSE connection so live display catches early events, but bound
+  // it by the deadline (connected resolves even on connect failure, so the only
+  // thing this guards against is a server that accepts the socket then stalls).
+  await Promise.race([handle.connected, abortedP]);
+  if (abort.signal.aborted) return finish(abortReason());
+
+  // Snapshot existing assistant message IDs BEFORE sending so a brand-new
+  // finalized assistant message unambiguously marks our turn's completion.
+  const snap = await Promise.race([
+    snapshotAssistantIds(client, sessionId).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e })
+    ),
+    abortedP,
+  ]);
+  if (snap === ABORTED) return finish(abortReason());
+  if (!snap.ok) {
+    finish("disconnected");
+    throw snap.e;
+  }
+  const priorAssistantIds = snap.v;
+
+  const sent = await Promise.race([
+    clientV2.session
+      .promptAsync({
+        sessionID: sessionId,
+        parts: [{ type: "text", text: messageText }],
+        ...(model && { model }),
+        ...(agent && { agent }),
+        ...(variant && { variant }),
+        ...(noReply && { noReply: true }),
+      })
+      .then(
+        () => ({ ok: true as const }),
+        (e) => ({ ok: false as const, e })
+      ),
+    abortedP,
+  ]);
+  if (sent === ABORTED) return finish(abortReason());
+  if (!sent.ok) {
+    // promptAsync failed (auth / network / 400) — surface the real error.
+    finish("disconnected");
+    throw sent.e;
+  }
+
+  // Context injection produces no assistant turn: nothing to wait for.
+  if (noReply) return finish("completed");
+
+  // The deadline is owned by the hard timer (via the abort signal), so the
+  // wait is signal-driven; a deadline abort surfaces as `timedOut`.
+  const turn = await waitForTurnComplete(client, sessionId, {
+    priorAssistantIds,
+    pollIntervalMs: POLL_INTERVAL_MS,
+    onPoke: (p) => {
+      poke = p;
+    },
+    signal: abort.signal,
+  });
+  if (turn.status !== "completed") return finish(abortReason());
+
+  // Main turn finished. With --wait-children, also wait for sub-agents to idle.
+  if (waitChildren) {
+    const childReason = await waitForChildrenIdle(client, sessionId, abort.signal);
+    if (childReason !== "completed") return finish(abortReason());
+    return finish("completed");
+  }
+
+  return finish("completed");
+}
+
+/**
+ * Poll the session tree until every sub-agent (descendant) is idle, stopping if
+ * the shared abort signal fires (deadline or interrupt). Best-effort: on servers
+ * whose `session.status()` omits busy children this returns as soon as no active
+ * child is observed (matching `wait-for-idle`/`is-idle` semantics).
+ */
+async function waitForChildrenIdle(
+  client: OpencodeClient,
+  sessionId: string,
+  signal: AbortSignal
+): Promise<StreamExitReason> {
+  // Single abort listener (registered once) ends the current sleep early.
+  let endSleep: (() => void) | undefined;
+  const onAbort = (): void => endSleep?.();
+  signal.addEventListener("abort", onAbort);
   try {
-    await Promise.race([promptP, done]);
-  } catch (err) {
-    // promptAsync failed (auth/Network/400). Clean up timers/SSE, then surface
-    // the real error rather than masking it as "lost connection".
-    cleanup();
-    throw err;
+    while (true) {
+      if (signal.aborted) return "disconnected";
+      try {
+        const derived = await getDerivedSessionStatus(client, sessionId);
+        if (derived.allIdle) return "completed";
+      } catch {
+        // Tree status unavailable; retry until the signal aborts.
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          endSleep = undefined;
+          resolve();
+        }, CHILD_POLL_INTERVAL_MS);
+        endSleep = () => {
+          clearTimeout(timer);
+          endSleep = undefined;
+          resolve();
+        };
+      });
+    }
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
-  if (state.settled) {
-    // Settled while promptAsync was still in flight; swallow any late rejection
-    // so it doesn't surface as an unhandled promise rejection after we return.
-    promptP.catch(() => {});
-    return done;
-  }
-  state.promptResolvedAt = Date.now();
-
-  // Immediate probe fast-paths sawBusy if the server is already busy.
-  await Promise.race([probeStatus(), done]);
-  if (state.settled) {
-    // The probe settled (e.g. --no-reply with the session already idle): do not
-    // arm the periodic poller (cleanup() already ran).
-    return done;
-  }
-
-  // Periodic fallback in case the terminal SSE event is missed or never sent.
-  state.pollTimer = setInterval(() => {
-    void probeStatus();
-  }, POLL_INTERVAL_MS);
-
-  return done;
 }
