@@ -63,7 +63,7 @@ occtl stream -s <id> "prompt" --timeout 600 # exit 124 if not idle in time, then
 occtl stream -s <id> "prompt" --wait-children # also wait for sub-agent sessions
 ```
 
-`stream` exits 0 on idle (detected via `session.idle`/`session.status` SSE plus a status API fallback, so it never hangs on a missed terminal event). `--timeout <seconds>` exits 124 if still busy; read the result with `occtl last`. Diagnostics go to stderr, keeping `--json` stdout valid NDJSON. By default it tracks only the main agent; add `--wait-children` for the tree-aware semantics (`wait-for-idle`/`is-idle` defaults) that also wait for sub-agents.
+`stream` exits 0 once the submitted turn finishes, detected by polling `session.messages` for a new finalized assistant message (`time.completed`/error) keyed off a pre-send snapshot — robust even when the server emits no `session.idle`/`session.status` SSE events, and it never exits pre-turn. SSE is used for best-effort live display and only accelerates the poll. `--timeout <seconds>` exits 124 if the turn has not finished; read the result with `occtl last`. Diagnostics go to stderr, keeping `--json` stdout valid NDJSON. By default it tracks only the main agent; add `--wait-children` for the tree-aware semantics (`wait-for-idle`/`is-idle` defaults) that also wait for sub-agents.
 
 Use `stream` or `send -w` for race-safe single-session automation. Parent sessions with active sub-agents report `waiting`; pass `--main-agent` to `status`, `wait-for-idle`, or `is-idle` only when parent-only status is intended. If using `send --async`, wait with `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
 

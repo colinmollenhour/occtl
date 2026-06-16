@@ -10,7 +10,7 @@ import {
 } from "../client.js";
 import { extractText } from "../format.js";
 import { spawnOpencodeServer, type SpawnedServer } from "../spawn.js";
-import { startStream } from "../sse.js";
+import { snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
 
 interface RunOpts {
   model?: string;
@@ -197,26 +197,30 @@ async function runAction(positionalParts: string[], opts: RunOpts): Promise<void
       query: { directory },
     });
     if (!created.data) {
+      await cleanup();
       dieDiag(opts.stderr, 1, "occtl run: session create failed\n");
     }
     const sessionId = created.data.id;
 
-    // ─── Open SSE BEFORE sending so we don't race the busy/idle transition ─
-    // (See `occtl stream` for the same pattern. The bare API status check
-    // can return idle for a freshly-prompted session whose worker hasn't
-    // picked up the message yet.)
-    const handle = startStream(sessionId, (event) => {
-      if (event.type === "session.idle") return "stop";
-    });
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        handle.cancel();
-      }, timeoutMs);
+    // Write the session sidecar early so a later timeout/disconnect is still
+    // recoverable via `occtl last <session>` even if we capture nothing.
+    if (opts.out) writeOut(`${opts.out}.session`, `${sessionId}\n`);
+
+    // Snapshot existing assistant message IDs before sending so a brand-new
+    // finalized assistant message unambiguously marks our turn's completion.
+    // (Empty on a freshly created session; the helper guards against a
+    // transient-failure empty set on existing sessions.)
+    let priorAssistantIds: Set<string> = new Set();
+    try {
+      priorAssistantIds = await snapshotAssistantIds(client, sessionId);
+    } catch (err) {
+      await cleanup();
+      dieDiag(
+        opts.stderr,
+        1,
+        `occtl run: cannot reach OpenCode server: ${(err as Error).message}\nsession_id: ${sessionId}\n`
+      );
     }
-    await handle.connected;
 
     // ─── Send prompt ──────────────────────────────────────────────────────
     type PromptParams = Parameters<typeof clientV2.session.promptAsync>[0];
@@ -231,56 +235,54 @@ async function runAction(positionalParts: string[], opts: RunOpts): Promise<void
 
     await clientV2.session.promptAsync(params);
 
-    // ─── Wait for session.idle ────────────────────────────────────────────
-    const streamResult = await handle.result;
-    if (timer) clearTimeout(timer);
+    // ─── Wait for the submitted turn to finish ────────────────────────────
+    // Poll message state (a new assistant message with `time.completed`/`error`)
+    // rather than the `session.idle` SSE event — this server may never deliver
+    // it. Holds no long-lived connection, so it is safe for long agentic turns.
+    const turn = await waitForTurnComplete(client, sessionId, {
+      priorAssistantIds,
+      timeoutMs,
+    });
 
-    if (timedOut || streamResult === "disconnected") {
-      if (opts.out) writeOut(`${opts.out}.session`, `${sessionId}\n`);
+    if (turn.status !== "completed") {
       try {
         await client.session.abort({ path: { id: sessionId } });
       } catch {
         /* ignore */
       }
-      const code = timedOut ? 124 : 1;
+      const code = turn.status === "timeout" ? 124 : 1;
       const baseUrl = getBaseUrl();
-      const diag = timedOut
-        ? `occtl run: timed out after ${timeoutMs}ms.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nbase_url: ${baseUrl}\n`
-        : `occtl run: lost connection to OpenCode server while waiting for session.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nbase_url: ${baseUrl}\n`;
+      const diag =
+        turn.status === "timeout"
+          ? `occtl run: timed out after ${timeoutMs}ms.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nbase_url: ${baseUrl}\n`
+          : `occtl run: lost connection to OpenCode server while waiting for the turn.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nbase_url: ${baseUrl}\n`;
+      await cleanup();
       dieDiag(opts.stderr, code, diag);
     }
 
-    // ─── Fetch last assistant message ─────────────────────────────────────
-    const msgs = await client.session.messages({ path: { id: sessionId } });
-    const messages = msgs.data ?? [];
-    const last = messages.filter((m) => m.info.role === "assistant").pop();
-    if (!last) {
-      if (opts.out) writeOut(`${opts.out}.session`, `${sessionId}\n`);
-      dieDiag(
-        opts.stderr,
-        1,
-        `occtl run: no assistant message in session.\nmodel: ${opts.model}\nsession_id: ${sessionId}\n`
-      );
-    }
-
-    const text = extractText(last.parts);
+    // ─── Use the completed assistant message ──────────────────────────────
+    // `turn` is narrowed to the "completed" variant here (the block above exits
+    // for every other status), so `message`/`parts` are guaranteed present.
+    const message = turn.message;
+    const parts = turn.parts;
+    const text = extractText(parts);
 
     // ─── Write outputs ────────────────────────────────────────────────────
     if (opts.out) {
       writeOut(opts.out, text);
-      writeOut(`${opts.out}.session`, `${sessionId}\n`);
     } else {
       process.stdout.write(text);
       if (text && !text.endsWith("\n")) process.stdout.write("\n");
     }
 
     if (opts.raw) {
-      writeOut(opts.raw, JSON.stringify(last, null, 2));
+      writeOut(opts.raw, JSON.stringify({ info: message, parts }, null, 2));
     }
 
     // ─── Empty-response detection ─────────────────────────────────────────
     if (!text.trim()) {
-      const diag = `occtl run: provider returned no text — there could be an availability issue or account spending limits may have been reached.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nparts: ${last.parts.length}\n`;
+      const diag = `occtl run: provider returned no text — there could be an availability issue or account spending limits may have been reached.\nmodel: ${opts.model}\nsession_id: ${sessionId}\nparts: ${parts.length}\n`;
+      await cleanup();
       dieDiag(opts.stderr, 1, diag);
     }
 
