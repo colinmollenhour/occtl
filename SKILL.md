@@ -59,7 +59,10 @@ occtl send --stdin -s <id> < prompt.md       # prompt from stdin
 occtl send --no-reply -s <id> "context"     # add context only
 occtl stream -s <id> "prompt"               # send + stream until idle
 occtl stream --json -s <id> "prompt"        # NDJSON event stream
+occtl stream -s <id> "prompt" --timeout 600 # exit 124 if not idle in time, then `occtl last`
 ```
+
+`stream` exits 0 on idle (detected via `session.idle`/`session.status` SSE plus a status API fallback, so it never hangs on a missed terminal event). `--timeout <seconds>` exits 124 if still busy; read the result with `occtl last`. Diagnostics go to stderr, keeping `--json` stdout valid NDJSON.
 
 Use `stream` or `send -w` for race-safe single-session automation. Parent sessions with active sub-agents report `waiting`; pass `--main-agent` to `status`, `wait-for-idle`, or `is-idle` only when parent-only status is intended. If using `send --async`, wait with `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
 
