@@ -4,6 +4,7 @@ import { existsSync } from "fs";
 import { resolve, basename } from "path";
 import { ensureServer } from "../client.js";
 import { formatJSON, formatMessage } from "../format.js";
+import { getPermissionFromEvent, respondToPermission } from "../permission-util.js";
 import { startStream } from "../sse.js";
 import { waitForIdle } from "../wait-util.js";
 
@@ -332,21 +333,14 @@ export function worktreeRunCommand(): Command {
       let approveHandle: ReturnType<typeof startStream> | undefined;
       if (opts.autoApprove) {
         approveHandle = startStream(sid, async (event) => {
-          if (event.type !== "permission.updated") return;
-          const props = event.properties as {
-            id: string;
-            status?: string;
-          };
-          if (props.status && props.status !== "pending") return;
+          const permission = getPermissionFromEvent(event, sid);
+          if (!permission) return;
           try {
-            await client.postSessionIdPermissionsPermissionId({
-              path: { id: sid, permissionID: props.id },
-              body: { response: "once" },
-            });
-            console.error(`Auto-approved: ${props.id}`);
+            await respondToPermission(sid, permission.id, "once");
+            console.error(`Auto-approved: ${permission.id}`);
           } catch (err) {
             console.error(
-              `Failed to auto-approve ${props.id}: ${err instanceof Error ? err.message : String(err)}`
+              `Failed to auto-approve ${permission.id}: ${err instanceof Error ? err.message : String(err)}`
             );
           }
         });
@@ -377,7 +371,9 @@ export function worktreeRunCommand(): Command {
       }
 
       // --wait: use race-safe waitForIdle
-      const waitResult = await waitForIdle(client, sid);
+      const waitResult = await waitForIdle(client, sid, undefined, {
+        requireBusy: true,
+      });
 
       // Clean up auto-approve
       approveHandle?.cancel();

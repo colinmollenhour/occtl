@@ -103,6 +103,8 @@ occtl is-idle <id> --main-agent
 
 Race rule: new sessions may report idle before async prompt starts. After `send --async`, use `--require-busy`, `wait-for-text`, `send -w`, or `stream`.
 
+Permission rule: `occtl respond --wait` handles requests that were already pending before the command started, then watches for new requests. Use `--auto-approve --wait` only when approving every request with `once` is acceptable for that session and repository.
+
 Use `wait-any` when you want to react to whichever worker finishes first. Use `wait-all` as a barrier before verification, merge, or final report.
 
 Timeout rule: do not blindly retry. Check `occtl is-idle <id>` and `occtl summary <id>`. If still busy, wait longer or abort deliberately. Retry in a fresh session, not same session.

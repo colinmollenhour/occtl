@@ -1,4 +1,6 @@
 import type { OpencodeClient, AssistantMessage, Part } from "@opencode-ai/sdk";
+import type { SessionMessage, SessionMessageAssistant } from "@opencode-ai/sdk/v2";
+import { listAllSessionMessagesV2 } from "./client.js";
 
 /**
  * Some opencode server versions cap `session.messages` at ~100 rows unless an
@@ -57,6 +59,65 @@ interface MessageEnvelope {
     error?: unknown;
   };
   parts: Part[];
+}
+
+function v2AssistantToEnvelope(message: SessionMessageAssistant): MessageEnvelope {
+  const providerID = message.model.providerID;
+  const modelID = message.model.id;
+  const parts = message.content.map((content) => {
+    if (content.type === "text" || content.type === "reasoning") {
+      return { type: content.type, id: content.id, text: content.text } as unknown as Part;
+    }
+    return {
+      type: "tool",
+      id: content.id,
+      tool: content.name,
+      state: content.state,
+      time: content.time,
+    } as unknown as Part;
+  });
+
+  return {
+    info: {
+      id: message.id,
+      role: "assistant",
+      time: message.time,
+      error: message.error,
+      providerID,
+      modelID,
+      cost: message.cost ?? 0,
+      tokens: message.tokens ?? {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    } as unknown as MessageEnvelope["info"],
+    parts,
+  };
+}
+
+function v2MessagesToEnvelopes(messages: SessionMessage[]): MessageEnvelope[] {
+  return messages
+    .filter((message): message is SessionMessageAssistant => message.type === "assistant")
+    .map(v2AssistantToEnvelope);
+}
+
+async function loadMessageEnvelopes(
+  client: OpencodeClient,
+  sessionId: string
+): Promise<MessageEnvelope[]> {
+  try {
+    return v2MessagesToEnvelopes(await listAllSessionMessagesV2(sessionId));
+  } catch {
+    // Fall back to the legacy v1 envelope when a server is too old for the v2
+    // paged messages endpoint or if the projected message shape is unavailable.
+    const res = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: MESSAGES_LIMIT },
+    } as Parameters<typeof client.session.messages>[0]);
+    return (res.data ?? []) as unknown as MessageEnvelope[];
+  }
 }
 
 function lastAssistant(envelopes: MessageEnvelope[]): MessageEnvelope | undefined {
@@ -134,11 +195,7 @@ export async function waitForTurnComplete(
       if (signal?.aborted) return { status: "disconnected" };
 
       try {
-        const res = await client.session.messages({
-          path: { id: sessionId },
-          query: { limit: MESSAGES_LIMIT },
-        } as Parameters<typeof client.session.messages>[0]);
-        const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
+        const envelopes = await loadMessageEnvelopes(client, sessionId);
         consecutiveErrors = 0;
         const candidate = lastAssistant(envelopes);
         if (isFinishedTurn(candidate, priorAssistantIds)) {
@@ -192,11 +249,7 @@ export async function snapshotAssistantIds(
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await client.session.messages({
-        path: { id: sessionId },
-        query: { limit: MESSAGES_LIMIT },
-      } as Parameters<typeof client.session.messages>[0]);
-      const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
+      const envelopes = await loadMessageEnvelopes(client, sessionId);
       const ids = new Set<string>();
       for (const env of envelopes) {
         if (env.info.role === "assistant") ids.add(env.info.id);

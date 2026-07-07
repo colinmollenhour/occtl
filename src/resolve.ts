@@ -1,4 +1,5 @@
 import type { OpencodeClient, Session } from "@opencode-ai/sdk";
+import { listAllSessions } from "./client.js";
 
 /**
  * Resolve a session ID. If none is provided, returns the most recently updated session
@@ -11,10 +12,7 @@ export async function resolveSession(
   if (!sessionId) {
     // Get most recent session for the current directory
     const dir = process.cwd();
-    const result = await client.session.list({
-      query: { directory: dir },
-    });
-    let sessions = (result.data ?? []).filter(
+    let sessions = (await listAllSessions(client, { directory: dir })).filter(
       (s: Session) => !s.parentID && s.directory === dir
     );
     if (sessions.length === 0) {
@@ -38,8 +36,7 @@ export async function resolveSession(
   }
 
   // Try partial match (global search so partial IDs work across all sessions)
-  const result = await client.session.list();
-  const sessions = result.data ?? [];
+  const sessions = await listAllSessions(client);
   const matches = sessions.filter(
     (s: Session) =>
       s.id.startsWith(sessionId) ||

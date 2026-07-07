@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { ensureServer } from "../client.js";
+import { ensureServer, listAllSessions } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import {
   formatJSON,
@@ -33,16 +33,19 @@ export function sessionSummaryCommand(): Command {
         await Promise.all([
           client.session.get({ path: { id: resolved } }),
           client.session.status(),
-          client.session.messages({ path: { id: resolved } }),
+          client.session.messages({
+            path: { id: resolved },
+            query: { limit: 100000 },
+          } as Parameters<typeof client.session.messages>[0]),
           client.session.todo({ path: { id: resolved } }),
-          client.session.list({}),
+          listAllSessions(client),
         ]);
 
       const session = sessionResult.data;
       const statuses = statusResult.data ?? {};
       const messages = messagesResult.data ?? [];
       const todos = todoResult.data ?? [];
-      const sessions = sessionsResult.data ?? [];
+      const sessions = sessionsResult;
 
       // Compute status
       const derivedStatus = deriveSessionStatus(resolved, statuses, sessions);

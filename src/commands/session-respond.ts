@@ -1,9 +1,16 @@
 import { Command } from "commander";
-import { ensureServer, getClient } from "../client.js";
+import { ensureServer } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import { formatJSON } from "../format.js";
 import { streamEvents } from "../sse.js";
 import type { StreamResult } from "../sse.js";
+import {
+  getPermissionFromEvent,
+  listPendingPermissions,
+  respondToPermission,
+  type PendingPermission,
+  type PermissionResponse,
+} from "../permission-util.js";
 
 export function sessionRespondCommand(): Command {
   return new Command("respond")
@@ -60,18 +67,6 @@ export function sessionRespondCommand(): Command {
     });
 }
 
-async function respondToPermission(
-  sessionId: string,
-  permissionId: string,
-  response: "once" | "always" | "reject"
-): Promise<void> {
-  const client = getClient();
-  await client.postSessionIdPermissionsPermissionId({
-    path: { id: sessionId, permissionID: permissionId },
-    body: { response },
-  });
-}
-
 async function waitAndRespond(
   sessionId: string,
   opts: { response: string; json?: boolean; autoApprove?: boolean }
@@ -79,42 +74,49 @@ async function waitAndRespond(
   console.error(`Waiting for permission requests on session ${sessionId}...`);
   console.error("Press Ctrl+C to stop.\n");
 
-  const result: StreamResult = await streamEvents(sessionId, async (event) => {
-    if (event.type !== "permission.updated") return;
-
-    const props = event.properties as {
-      id: string;
-      title: string;
-      type: string;
-      status?: string;
-      sessionID?: string;
-    };
-
-    // Skip permissions that are not pending (already resolved)
-    if (props.status && props.status !== "pending") return;
+  const handled = new Set<string>();
+  const processPermission = async (
+    permission: PendingPermission
+  ): Promise<"stop" | undefined> => {
+    if (handled.has(permission.id)) return undefined;
+    handled.add(permission.id);
 
     console.error(
-      `Permission request: ${props.title} (type: ${props.type}, id: ${props.id})`
+      `Permission request: ${permission.title} (type: ${permission.type}, id: ${permission.id})`
     );
 
     try {
       if (opts.autoApprove) {
-        await respondToPermission(sessionId, props.id, "once");
-        console.error(`Auto-approved: ${props.id}`);
+        await respondToPermission(sessionId, permission.id, "once");
+        console.error(`Auto-approved: ${permission.id}`);
       } else {
         await respondToPermission(
           sessionId,
-          props.id,
-          opts.response as "once" | "always" | "reject"
+          permission.id,
+          opts.response as PermissionResponse
         );
-        console.error(`Responded with "${opts.response}": ${props.id}`);
+        console.error(`Responded with "${opts.response}": ${permission.id}`);
         return "stop";
       }
     } catch (err) {
+      handled.delete(permission.id);
       console.error(
-        `Failed to respond to ${props.id}: ${err instanceof Error ? err.message : String(err)}`
+        `Failed to respond to ${permission.id}: ${err instanceof Error ? err.message : String(err)}`
       );
     }
+    return undefined;
+  };
+
+  for (const permission of await listPendingPermissions(sessionId)) {
+    const outcome = await processPermission(permission);
+    if (outcome === "stop") return;
+  }
+
+  const result: StreamResult = await streamEvents(sessionId, async (event) => {
+    const permission = getPermissionFromEvent(event, sessionId);
+    if (!permission) return;
+
+    return processPermission(permission);
   });
 
   if (result === "disconnected") {
