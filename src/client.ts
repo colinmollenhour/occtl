@@ -176,11 +176,12 @@ export async function listActiveSessionIds(): Promise<Set<string>> {
  */
 export async function listAllSessionMessagesV2(
   sessionId: string,
-  order: "asc" | "desc" = "asc"
+  order: "asc" | "desc" = "asc",
+  maxPages = 200
 ): Promise<SessionMessage[]> {
   const messages: SessionMessage[] = [];
   let cursor: string | undefined;
-  for (let page = 0; page < 200; page++) {
+  for (let page = 0; page < maxPages; page++) {
     const result = await getClientV2().v2.session.messages({
       sessionID: sessionId,
       limit: 200,
@@ -191,7 +192,7 @@ export async function listAllSessionMessagesV2(
     });
     const body = result.data;
     messages.push(...(body?.data ?? []));
-    cursor = body?.cursor.next;
+    cursor = body?.cursor?.next;
     if (!cursor) break;
   }
   return messages;

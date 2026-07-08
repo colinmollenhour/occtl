@@ -68,6 +68,9 @@ function v2AssistantToEnvelope(message: SessionMessageAssistant): MessageEnvelop
     if (content.type === "text" || content.type === "reasoning") {
       return { type: content.type, id: content.id, text: content.text } as unknown as Part;
     }
+    if (content.type !== "tool") {
+      return content as unknown as Part;
+    }
     return {
       type: "tool",
       id: content.id,
@@ -105,10 +108,17 @@ function v2MessagesToEnvelopes(messages: SessionMessage[]): MessageEnvelope[] {
 
 async function loadMessageEnvelopes(
   client: OpencodeClient,
-  sessionId: string
+  sessionId: string,
+  newestPageOnly = false
 ): Promise<MessageEnvelope[]> {
   try {
-    return v2MessagesToEnvelopes(await listAllSessionMessagesV2(sessionId));
+    const messages = await listAllSessionMessagesV2(
+      sessionId,
+      newestPageOnly ? "desc" : "asc",
+      newestPageOnly ? 1 : 200
+    );
+    if (newestPageOnly) messages.reverse();
+    return v2MessagesToEnvelopes(messages);
   } catch {
     // Fall back to the legacy v1 envelope when a server is too old for the v2
     // paged messages endpoint or if the projected message shape is unavailable.
@@ -195,7 +205,7 @@ export async function waitForTurnComplete(
       if (signal?.aborted) return { status: "disconnected" };
 
       try {
-        const envelopes = await loadMessageEnvelopes(client, sessionId);
+        const envelopes = await loadMessageEnvelopes(client, sessionId, true);
         consecutiveErrors = 0;
         const candidate = lastAssistant(envelopes);
         if (isFinishedTurn(candidate, priorAssistantIds)) {

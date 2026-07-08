@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { ensureServer } from "../client.js";
 import { resolveSession } from "../resolve.js";
 import { formatJSON } from "../format.js";
-import { streamEvents } from "../sse.js";
+import { startStream } from "../sse.js";
 import type { StreamResult } from "../sse.js";
 import {
   getPermissionFromEvent,
@@ -107,17 +107,23 @@ async function waitAndRespond(
     return undefined;
   };
 
-  for (const permission of await listPendingPermissions(sessionId)) {
-    const outcome = await processPermission(permission);
-    if (outcome === "stop") return;
-  }
-
-  const result: StreamResult = await streamEvents(sessionId, async (event) => {
+  const handle = startStream(sessionId, async (event) => {
     const permission = getPermissionFromEvent(event, sessionId);
     if (!permission) return;
 
     return processPermission(permission);
   });
+  await handle.connected;
+
+  for (const permission of await listPendingPermissions(sessionId)) {
+    const outcome = await processPermission(permission);
+    if (outcome === "stop") {
+      handle.cancel();
+      return;
+    }
+  }
+
+  const result: StreamResult = await handle.result;
 
   if (result === "disconnected") {
     console.error("Error: lost connection to OpenCode server.");

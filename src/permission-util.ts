@@ -30,7 +30,7 @@ export async function listPendingPermissions(
   return (result.data?.data ?? []).map((request: PermissionV2Request) => ({
     id: request.id,
     title: request.action,
-    type: request.resources.join(", ") || "permission",
+    type: request.resources?.join(", ") || "permission",
   }));
 }
 
