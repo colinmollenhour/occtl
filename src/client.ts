@@ -2,6 +2,7 @@ import { createOpencodeClient, type OpencodeClient, type Session } from "@openco
 import {
   createOpencodeClient as createOpencodeClientV2,
   type OpencodeClient as OpencodeClientV2,
+  type SessionMessage,
 } from "@opencode-ai/sdk/v2";
 import { execSync } from "child_process";
 
@@ -149,6 +150,52 @@ export async function listAllSessions(
     limit *= 4;
   }
   return Array.from(seen.values());
+}
+
+/**
+ * Return session IDs that OpenCode's v2 runtime currently considers active.
+ *
+ * This is intentionally additive: v2 `session.active()` reports foreground
+ * running drains only, so it cannot replace the richer v1 `session.status()`
+ * map or occtl's parent/child `waiting` derivation. Callers should use it as a
+ * supplementary signal, not as the source of truth for idle/retry semantics.
+ */
+export async function listActiveSessionIds(): Promise<Set<string>> {
+  const result = await getClientV2().v2.session.active();
+  const active = result.data?.data ?? {};
+  return new Set(Object.keys(active));
+}
+
+/**
+ * Page through the v2 projected session messages endpoint.
+ *
+ * This adopts the new cursor-based messages API for code that only needs the
+ * projected message timeline. It deliberately does not use durable
+ * `session.history()` events for turn completion, because those events are not
+ * a stable replacement for finalized assistant message state and parts.
+ */
+export async function listAllSessionMessagesV2(
+  sessionId: string,
+  order: "asc" | "desc" = "asc",
+  maxPages = 200
+): Promise<SessionMessage[]> {
+  const messages: SessionMessage[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const result = await getClientV2().v2.session.messages({
+      sessionID: sessionId,
+      limit: 200,
+      // The cursor encodes direction after the first page; sending `order`
+      // alongside a cursor is invalid per the generated SDK docs.
+      order: cursor ? undefined : order,
+      cursor,
+    });
+    const body = result.data;
+    messages.push(...(body?.data ?? []));
+    cursor = body?.cursor?.next;
+    if (!cursor) break;
+  }
+  return messages;
 }
 
 export async function ensureServer(): Promise<OpencodeClient> {

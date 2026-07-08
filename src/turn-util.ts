@@ -1,4 +1,6 @@
 import type { OpencodeClient, AssistantMessage, Part } from "@opencode-ai/sdk";
+import type { SessionMessage, SessionMessageAssistant } from "@opencode-ai/sdk/v2";
+import { listAllSessionMessagesV2 } from "./client.js";
 
 /**
  * Some opencode server versions cap `session.messages` at ~100 rows unless an
@@ -9,13 +11,15 @@ import type { OpencodeClient, AssistantMessage, Part } from "@opencode-ai/sdk";
  * so this is defensive insurance across server versions.
  */
 const MESSAGES_LIMIT = 100000;
+const STABLE_FALLBACK_MS = 5000;
 
 /**
  * Outcome of waiting for a submitted prompt's turn to finish. Modeled as a
  * discriminated union so `message`/`parts` are guaranteed present exactly when
  * `status === "completed"`.
  *  - "completed":    the turn's assistant message exists and is finalized
- *                    (`time.completed` set, or a terminal `error`).
+ *                    (`time.completed` set, terminal `error`, or a stable
+ *                    final text fallback for providers that omit completion).
  *  - "timeout":      the deadline elapsed first.
  *  - "disconnected": the server became unreachable / the wait was aborted.
  */
@@ -59,6 +63,81 @@ interface MessageEnvelope {
   parts: Part[];
 }
 
+type StableCandidate = {
+  id: string;
+  signature: string;
+  firstSeenAt: number;
+};
+
+function v2AssistantToEnvelope(message: SessionMessageAssistant): MessageEnvelope {
+  const providerID = message.model.providerID;
+  const modelID = message.model.id;
+  const parts = message.content.map((content) => {
+    if (content.type === "text" || content.type === "reasoning") {
+      return { type: content.type, id: content.id, text: content.text } as unknown as Part;
+    }
+    if (content.type !== "tool") {
+      return content as unknown as Part;
+    }
+    return {
+      type: "tool",
+      id: content.id,
+      tool: content.name,
+      state: content.state,
+      time: content.time,
+    } as unknown as Part;
+  });
+
+  return {
+    info: {
+      id: message.id,
+      role: "assistant",
+      time: message.time,
+      error: message.error,
+      providerID,
+      modelID,
+      cost: message.cost ?? 0,
+      tokens: message.tokens ?? {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    } as unknown as MessageEnvelope["info"],
+    parts,
+  };
+}
+
+function v2MessagesToEnvelopes(messages: SessionMessage[]): MessageEnvelope[] {
+  return messages
+    .filter((message): message is SessionMessageAssistant => message.type === "assistant")
+    .map(v2AssistantToEnvelope);
+}
+
+async function loadMessageEnvelopes(
+  client: OpencodeClient,
+  sessionId: string,
+  newestPageOnly = false
+): Promise<MessageEnvelope[]> {
+  try {
+    const messages = await listAllSessionMessagesV2(
+      sessionId,
+      newestPageOnly ? "desc" : "asc",
+      newestPageOnly ? 1 : 200
+    );
+    if (newestPageOnly) messages.reverse();
+    return v2MessagesToEnvelopes(messages);
+  } catch {
+    // Fall back to the legacy v1 envelope when a server is too old for the v2
+    // paged messages endpoint or if the projected message shape is unavailable.
+    const res = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: MESSAGES_LIMIT },
+    } as Parameters<typeof client.session.messages>[0]);
+    return (res.data ?? []) as unknown as MessageEnvelope[];
+  }
+}
+
 function lastAssistant(envelopes: MessageEnvelope[]): MessageEnvelope | undefined {
   for (let i = envelopes.length - 1; i >= 0; i--) {
     if (envelopes[i].info.role === "assistant") return envelopes[i];
@@ -66,13 +145,35 @@ function lastAssistant(envelopes: MessageEnvelope[]): MessageEnvelope | undefine
   return undefined;
 }
 
+function getText(parts: Part[]): string {
+  return parts
+    .filter((part) => part.type === "text")
+    .map((part) => (part as { text?: string }).text ?? "")
+    .join("\n");
+}
+
+function hasActiveTool(parts: Part[]): boolean {
+  return parts.some((part) => {
+    if (part.type !== "tool") return false;
+    const status = (part as { state?: { status?: string } }).state?.status;
+    return status === "pending" || status === "running" || status === "in_progress";
+  });
+}
+
+function stableSignature(env: MessageEnvelope): string | undefined {
+  const text = getText(env.parts).trim();
+  if (!text || hasActiveTool(env.parts)) return undefined;
+  return JSON.stringify({ text, parts: env.parts });
+}
+
 /**
  * Is this assistant envelope the finished product of a turn we submitted?
  * It must be a *new* message (id not in the pre-send snapshot) that the server
  * has finalized — either `time.completed` is set or a terminal `error` is
- * attached (provider error / output-length / aborted / api). Transient retries
- * surface as a session "retry" status, not as `info.error`, so keying on error
- * cannot trip mid-turn.
+ * attached (provider error / output-length / aborted / api). Providers that
+ * omit completion timestamps are handled by the stable-content fallback in the
+ * wait loop. Transient retries surface as a session "retry" status, not as
+ * `info.error`, so keying on error cannot trip mid-turn.
  */
 function isFinishedTurn(
   env: MessageEnvelope | undefined,
@@ -83,12 +184,39 @@ function isFinishedTurn(
   return Boolean(env.info.time?.completed) || env.info.error != null;
 }
 
+function updateStableCandidate(
+  env: MessageEnvelope | undefined,
+  priorAssistantIds: Set<string>,
+  stable: StableCandidate | undefined,
+  now: number
+): { stable: StableCandidate | undefined; completed: boolean } {
+  if (!env || priorAssistantIds.has(env.info.id)) {
+    return { stable: undefined, completed: false };
+  }
+
+  const signature = stableSignature(env);
+  if (!signature) return { stable: undefined, completed: false };
+
+  if (stable?.id !== env.info.id || stable.signature !== signature) {
+    return {
+      stable: { id: env.info.id, signature, firstSeenAt: now },
+      completed: false,
+    };
+  }
+
+  return {
+    stable,
+    completed: now - stable.firstSeenAt >= STABLE_FALLBACK_MS,
+  };
+}
+
 /**
  * Poll `session.messages` until the assistant message produced by the just-sent
- * prompt is finalized. This is the single reliable "turn complete" signal: it
- * does not depend on SSE `session.idle`/`session.status` events (some opencode
- * server versions deliver none for a session) nor on a time-based grace (which
- * races the worker picking up the message and exits pre-turn).
+ * prompt is finalized. Prefer explicit message completion (`time.completed` or
+ * terminal `error`), and fall back to a short stable-content window for
+ * providers that persist final text without those terminal fields. This does
+ * not depend on SSE `session.idle`/`session.status` events, which some
+ * providers either omit or report between intra-turn steps.
  *
  * Robustness:
  *  - A *new* finalized assistant message can only appear after our turn ran, so
@@ -130,18 +258,29 @@ export async function waitForTurnComplete(
   try {
     let consecutiveErrors = 0;
     let first = true;
+    let stable: StableCandidate | undefined;
     while (true) {
       if (signal?.aborted) return { status: "disconnected" };
 
       try {
-        const res = await client.session.messages({
-          path: { id: sessionId },
-          query: { limit: MESSAGES_LIMIT },
-        } as Parameters<typeof client.session.messages>[0]);
-        const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
+        const envelopes = await loadMessageEnvelopes(client, sessionId, true);
         consecutiveErrors = 0;
         const candidate = lastAssistant(envelopes);
         if (isFinishedTurn(candidate, priorAssistantIds)) {
+          return {
+            status: "completed",
+            message: candidate!.info as unknown as AssistantMessage,
+            parts: candidate!.parts,
+          };
+        }
+        const stableResult = updateStableCandidate(
+          candidate,
+          priorAssistantIds,
+          stable,
+          Date.now()
+        );
+        stable = stableResult.stable;
+        if (stableResult.completed) {
           return {
             status: "completed",
             message: candidate!.info as unknown as AssistantMessage,
@@ -182,8 +321,10 @@ export async function waitForTurnComplete(
  * Snapshot the IDs of assistant messages currently in the session, to pass as
  * `priorAssistantIds` before sending a new prompt. Retries briefly so a
  * transient failure cannot silently return an empty set (which on an existing
- * session would let an already-completed prior message look "new"). Returns an
- * empty set for a session with no assistant messages yet (correct for `run`).
+ * session would let an already-completed prior message look "new"). Reads the
+ * newest page first because `waitForTurnComplete` compares against the latest
+ * assistant message while waiting for the submitted turn. Returns an empty set
+ * for a session with no assistant messages yet (correct for `run`).
  */
 export async function snapshotAssistantIds(
   client: OpencodeClient,
@@ -192,11 +333,7 @@ export async function snapshotAssistantIds(
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await client.session.messages({
-        path: { id: sessionId },
-        query: { limit: MESSAGES_LIMIT },
-      } as Parameters<typeof client.session.messages>[0]);
-      const envelopes = (res.data ?? []) as unknown as MessageEnvelope[];
+      const envelopes = await loadMessageEnvelopes(client, sessionId, true);
       const ids = new Set<string>();
       for (const env of envelopes) {
         if (env.info.role === "assistant") ids.add(env.info.id);

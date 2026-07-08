@@ -124,7 +124,7 @@ occtl respond "$SID" --wait --response always
 occtl respond "$SID" --auto-approve --wait
 ```
 
-`--auto-approve` approves each pending permission request with `once`. Keep it scoped to sessions and repositories where that behavior is acceptable.
+`respond --wait` first checks for permission requests that are already pending, then waits for new ones. `--auto-approve` approves each pending permission request with `once`; keep it scoped to sessions and repositories where that behavior is acceptable.
 
 ### Discover models
 

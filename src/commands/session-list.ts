@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import path from "path";
-import { ensureServer, listAllSessions } from "../client.js";
+import { ensureServer, listActiveSessionIds, listAllSessions } from "../client.js";
 import { formatSession, formatSessionDetailed, formatJSON } from "../format.js";
 import { listStoredSessionIds, readDefaults } from "../session-defaults.js";
 import { deriveSessionStatus } from "../status-util.js";
@@ -96,15 +96,21 @@ export function sessionListCommand(): Command {
 
       // Filter to non-idle sessions if --active
       if (opts.active) {
-        const [statusResult, allSessions] = await Promise.all([
+        const [statusResult, allSessions, activeSessionIds] = await Promise.all([
           client.session.status(),
           listAllSessions(client),
+          listActiveSessionIds().catch(() => new Set<string>()),
         ]);
         const statuses = statusResult.data ?? {};
         sessions = sessions.filter((s) => {
+          if (activeSessionIds.has(s.id)) return true;
           const status = statuses[s.id];
           if (opts.mainAgent) return status && status.type !== "idle";
-          return !deriveSessionStatus(s.id, statuses, allSessions).allIdle;
+          const derived = deriveSessionStatus(s.id, statuses, allSessions);
+          return (
+            !derived.allIdle ||
+            derived.children.some((childId) => activeSessionIds.has(childId))
+          );
         });
       }
 
