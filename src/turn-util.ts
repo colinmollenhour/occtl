@@ -11,13 +11,15 @@ import { listAllSessionMessagesV2 } from "./client.js";
  * so this is defensive insurance across server versions.
  */
 const MESSAGES_LIMIT = 100000;
+const STABLE_FALLBACK_MS = 5000;
 
 /**
  * Outcome of waiting for a submitted prompt's turn to finish. Modeled as a
  * discriminated union so `message`/`parts` are guaranteed present exactly when
  * `status === "completed"`.
  *  - "completed":    the turn's assistant message exists and is finalized
- *                    (`time.completed` set, or a terminal `error`).
+ *                    (`time.completed` set, terminal `error`, or a stable
+ *                    final text fallback for providers that omit completion).
  *  - "timeout":      the deadline elapsed first.
  *  - "disconnected": the server became unreachable / the wait was aborted.
  */
@@ -60,6 +62,12 @@ interface MessageEnvelope {
   };
   parts: Part[];
 }
+
+type StableCandidate = {
+  id: string;
+  signature: string;
+  firstSeenAt: number;
+};
 
 function v2AssistantToEnvelope(message: SessionMessageAssistant): MessageEnvelope {
   const providerID = message.model.providerID;
@@ -137,13 +145,35 @@ function lastAssistant(envelopes: MessageEnvelope[]): MessageEnvelope | undefine
   return undefined;
 }
 
+function getText(parts: Part[]): string {
+  return parts
+    .filter((part) => part.type === "text")
+    .map((part) => (part as { text?: string }).text ?? "")
+    .join("\n");
+}
+
+function hasActiveTool(parts: Part[]): boolean {
+  return parts.some((part) => {
+    if (part.type !== "tool") return false;
+    const status = (part as { state?: { status?: string } }).state?.status;
+    return status === "pending" || status === "running" || status === "in_progress";
+  });
+}
+
+function stableSignature(env: MessageEnvelope): string | undefined {
+  const text = getText(env.parts).trim();
+  if (!text || hasActiveTool(env.parts)) return undefined;
+  return JSON.stringify({ text, parts: env.parts });
+}
+
 /**
  * Is this assistant envelope the finished product of a turn we submitted?
  * It must be a *new* message (id not in the pre-send snapshot) that the server
  * has finalized — either `time.completed` is set or a terminal `error` is
- * attached (provider error / output-length / aborted / api). Transient retries
- * surface as a session "retry" status, not as `info.error`, so keying on error
- * cannot trip mid-turn.
+ * attached (provider error / output-length / aborted / api). Providers that
+ * omit completion timestamps are handled by the stable-content fallback in the
+ * wait loop. Transient retries surface as a session "retry" status, not as
+ * `info.error`, so keying on error cannot trip mid-turn.
  */
 function isFinishedTurn(
   env: MessageEnvelope | undefined,
@@ -154,12 +184,39 @@ function isFinishedTurn(
   return Boolean(env.info.time?.completed) || env.info.error != null;
 }
 
+function updateStableCandidate(
+  env: MessageEnvelope | undefined,
+  priorAssistantIds: Set<string>,
+  stable: StableCandidate | undefined,
+  now: number
+): { stable: StableCandidate | undefined; completed: boolean } {
+  if (!env || priorAssistantIds.has(env.info.id)) {
+    return { stable: undefined, completed: false };
+  }
+
+  const signature = stableSignature(env);
+  if (!signature) return { stable: undefined, completed: false };
+
+  if (stable?.id !== env.info.id || stable.signature !== signature) {
+    return {
+      stable: { id: env.info.id, signature, firstSeenAt: now },
+      completed: false,
+    };
+  }
+
+  return {
+    stable,
+    completed: now - stable.firstSeenAt >= STABLE_FALLBACK_MS,
+  };
+}
+
 /**
  * Poll `session.messages` until the assistant message produced by the just-sent
- * prompt is finalized. This is the single reliable "turn complete" signal: it
- * does not depend on SSE `session.idle`/`session.status` events (some opencode
- * server versions deliver none for a session) nor on a time-based grace (which
- * races the worker picking up the message and exits pre-turn).
+ * prompt is finalized. Prefer explicit message completion (`time.completed` or
+ * terminal `error`), and fall back to a short stable-content window for
+ * providers that persist final text without those terminal fields. This does
+ * not depend on SSE `session.idle`/`session.status` events, which some
+ * providers either omit or report between intra-turn steps.
  *
  * Robustness:
  *  - A *new* finalized assistant message can only appear after our turn ran, so
@@ -201,6 +258,7 @@ export async function waitForTurnComplete(
   try {
     let consecutiveErrors = 0;
     let first = true;
+    let stable: StableCandidate | undefined;
     while (true) {
       if (signal?.aborted) return { status: "disconnected" };
 
@@ -209,6 +267,20 @@ export async function waitForTurnComplete(
         consecutiveErrors = 0;
         const candidate = lastAssistant(envelopes);
         if (isFinishedTurn(candidate, priorAssistantIds)) {
+          return {
+            status: "completed",
+            message: candidate!.info as unknown as AssistantMessage,
+            parts: candidate!.parts,
+          };
+        }
+        const stableResult = updateStableCandidate(
+          candidate,
+          priorAssistantIds,
+          stable,
+          Date.now()
+        );
+        stable = stableResult.stable;
+        if (stableResult.completed) {
           return {
             status: "completed",
             message: candidate!.info as unknown as AssistantMessage,
