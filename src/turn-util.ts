@@ -321,8 +321,10 @@ export async function waitForTurnComplete(
  * Snapshot the IDs of assistant messages currently in the session, to pass as
  * `priorAssistantIds` before sending a new prompt. Retries briefly so a
  * transient failure cannot silently return an empty set (which on an existing
- * session would let an already-completed prior message look "new"). Returns an
- * empty set for a session with no assistant messages yet (correct for `run`).
+ * session would let an already-completed prior message look "new"). Reads the
+ * newest page first because `waitForTurnComplete` compares against the latest
+ * assistant message while waiting for the submitted turn. Returns an empty set
+ * for a session with no assistant messages yet (correct for `run`).
  */
 export async function snapshotAssistantIds(
   client: OpencodeClient,
@@ -331,7 +333,7 @@ export async function snapshotAssistantIds(
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const envelopes = await loadMessageEnvelopes(client, sessionId);
+      const envelopes = await loadMessageEnvelopes(client, sessionId, true);
       const ids = new Set<string>();
       for (const env of envelopes) {
         if (env.info.role === "assistant") ids.add(env.info.id);

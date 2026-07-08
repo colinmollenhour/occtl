@@ -115,12 +115,18 @@ async function waitAndRespond(
   });
   await handle.connected;
 
-  for (const permission of await listPendingPermissions(sessionId)) {
-    const outcome = await processPermission(permission);
-    if (outcome === "stop") {
-      handle.cancel();
-      return;
+  try {
+    for (const permission of await listPendingPermissions(sessionId)) {
+      const outcome = await processPermission(permission);
+      if (outcome === "stop") {
+        handle.cancel();
+        return;
+      }
     }
+  } catch (err) {
+    console.error(
+      `Warning: failed to list pending permissions; waiting for new permission events instead: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   const result: StreamResult = await handle.result;
