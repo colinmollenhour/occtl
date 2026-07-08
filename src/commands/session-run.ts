@@ -10,7 +10,8 @@ import {
 } from "../client.js";
 import { extractText } from "../format.js";
 import { spawnOpencodeServer, type SpawnedServer } from "../spawn.js";
-import { snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
+import { startStream } from "../sse.js";
+import { makeIdleTracker, snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
 
 interface RunOpts {
   model?: string;
@@ -233,16 +234,34 @@ async function runAction(positionalParts: string[], opts: RunOpts): Promise<void
       ...(opts.thinking && { thinking: true }),
     } as unknown as PromptParams;
 
-    await clientV2.session.promptAsync(params);
-
-    // ─── Wait for the submitted turn to finish ────────────────────────────
-    // Poll message state (a new assistant message with `time.completed`/`error`)
-    // rather than the `session.idle` SSE event — this server may never deliver
-    // it. Holds no long-lived connection, so it is safe for long agentic turns.
-    const turn = await waitForTurnComplete(client, sessionId, {
-      priorAssistantIds,
-      timeoutMs,
+    // Best-effort SSE idle tracker (started before the send so the idle
+    // transition cannot be missed). Completion is still decided by polling
+    // message state; the tracker only lets the poller rescue turns the server
+    // abandons without finalizing the assistant message. If the event stream
+    // is unavailable the run behaves exactly as before.
+    const idleTracker = makeIdleTracker();
+    const events = startStream(sessionId, (event) => idleTracker.observe(event), {
+      reconnect: true,
     });
+    await events.connected;
+
+    let turn;
+    try {
+      await clientV2.session.promptAsync(params);
+
+      // ─── Wait for the submitted turn to finish ──────────────────────────
+      // Poll message state (a new assistant message with `time.completed`/
+      // `error`) rather than trusting SSE — a dead event stream must never
+      // block completion. Polling holds no long-lived connection, so it is
+      // safe for long agentic turns.
+      turn = await waitForTurnComplete(client, sessionId, {
+        priorAssistantIds,
+        timeoutMs,
+        idleSince: idleTracker.idleSince,
+      });
+    } finally {
+      events.cancel();
+    }
 
     if (turn.status !== "completed") {
       try {

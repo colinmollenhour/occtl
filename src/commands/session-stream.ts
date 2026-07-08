@@ -5,7 +5,7 @@ import { resolveSession } from "../resolve.js";
 import { readDefaults } from "../session-defaults.js";
 import { startStream, type StreamHandle } from "../sse.js";
 import { getDerivedSessionStatus } from "../status-util.js";
-import { snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
+import { makeIdleTracker, snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
 import { handleEvent } from "./session-watch.js";
 
 type StreamExitReason = "completed" | "timeout" | "disconnected";
@@ -151,8 +151,10 @@ interface RunStreamArgs {
  * `waitForTurnComplete`. This is the only signal that is reliable across
  * opencode server versions: some never deliver `session.idle`/`session.status`
  * SSE events for a session, and `session.status()` can report a busy session as
- * absent. The SSE stream here is therefore best-effort: it renders live output
- * and *pokes* the poller to re-check sooner, but it never decides completion.
+ * absent. The SSE stream here is therefore best-effort: it renders live output,
+ * *pokes* the poller to re-check sooner, and feeds the idle tracker that lets
+ * the poller rescue turns the server abandons without finalizing them — but a
+ * dead stream never blocks a normal completion.
  *
  * This fixes two regressions:
  *  - the premature empty exit (a pre-send snapshot means a fresh/idle session
@@ -223,22 +225,34 @@ async function runStream(args: RunStreamArgs): Promise<StreamExitReason> {
   });
   const abortReason = (): StreamExitReason => (timedOut ? "timeout" : "disconnected");
 
-  // Open the SSE stream first (best-effort live display + poll accelerator).
-  handle = startStream(sessionId, (event) => {
-    if (json) {
-      process.stdout.write(JSON.stringify(event) + "\n");
-    } else {
-      handleEvent(event);
-    }
-    // Only genuine terminal/transition hints nudge the poller — NOT per-delta
-    // message events. Poking on `message.part.updated` (per-token) would
-    // collapse the steady 1.5s cadence into a back-to-back full-history
-    // `session.messages()` loop for the whole turn, hammering the server and
-    // risking false `disconnected` exits under load on servers that stream.
-    if (event.type === "session.idle" || event.type === "session.status") {
-      poke?.();
-    }
-  });
+  // Open the SSE stream first (best-effort live display + poll accelerator +
+  // idle tracking for the abandoned-turn fallback). Reconnect on silent drops
+  // so a multi-hour turn cannot permanently lose the display or idle signal.
+  const idleTracker = makeIdleTracker();
+  handle = startStream(
+    sessionId,
+    (event) => {
+      idleTracker.observe(event);
+      if (json) {
+        process.stdout.write(JSON.stringify(event) + "\n");
+      } else {
+        handleEvent(event);
+      }
+      // Only genuine terminal/transition hints nudge the poller — NOT per-delta
+      // message events. Poking on per-token events would collapse the steady
+      // 1.5s cadence into a back-to-back full-history `session.messages()`
+      // loop for the whole turn, hammering the server and risking false
+      // `disconnected` exits under load on servers that stream.
+      if (
+        event.type === "session.idle" ||
+        event.type === "session.status" ||
+        event.type === "message.updated"
+      ) {
+        poke?.();
+      }
+    },
+    { reconnect: true }
+  );
 
   // Wait for the SSE connection so live display catches early events, but bound
   // it by the deadline (connected resolves even on connect failure, so the only
@@ -296,6 +310,7 @@ async function runStream(args: RunStreamArgs): Promise<StreamExitReason> {
     onPoke: (p) => {
       poke = p;
     },
+    idleSince: idleTracker.idleSince,
     signal: abort.signal,
   });
   if (turn.status !== "completed") return finish(abortReason());
