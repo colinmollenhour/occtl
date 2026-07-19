@@ -4,7 +4,7 @@ import { existsSync } from "fs";
 import { resolve, basename } from "path";
 import type { Message } from "@opencode-ai/sdk";
 import { ensureServer, getClientV2 } from "../client.js";
-import { formatJSON, formatMessage } from "../format.js";
+import { extractText, formatJSON, formatMessage } from "../format.js";
 import { getPermissionFromEvent, respondToPermission } from "../permission-util.js";
 import { startStream } from "../sse.js";
 import { makeIdleTracker, snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
@@ -266,6 +266,11 @@ export function worktreeRunCommand(): Command {
       "-w, --wait",
       "Block until this turn's assistant reply is finalized, then show it"
     )
+    .option(
+      "--timeout <seconds>",
+      "With --wait: exit 124 if the turn has not finished after this many " +
+        "seconds. Read the result with `occtl last`."
+    )
     .option("--auto-approve", "Auto-approve all permission requests")
     .option("--model <model>", "Model to use (format: provider/model)")
     .option("--agent <agent>", "Agent to use")
@@ -273,6 +278,20 @@ export function worktreeRunCommand(): Command {
     .option("-t, --text-only", "Show only text content")
     .option("--stdin", "Read message from stdin")
     .action(async (name: string, messageParts: string[], opts) => {
+      let timeoutMs = 0;
+      if (opts.timeout !== undefined) {
+        if (!opts.wait) {
+          console.error("--timeout requires --wait (-w).");
+          process.exit(2);
+        }
+        const timeoutSeconds = Number(opts.timeout);
+        if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+          console.error("--timeout must be a positive number of seconds.");
+          process.exit(2);
+        }
+        timeoutMs = timeoutSeconds * 1000;
+      }
+
       const client = await ensureServer();
 
       // Create the worktree
@@ -376,21 +395,14 @@ export function worktreeRunCommand(): Command {
         }
       }
 
-      // Prefer v2 promptAsync when waiting (same path as send/stream/run).
+      // Always use v2 promptAsync (same path as send/stream/run).
       const clientV2 = getClientV2();
-      if (opts.wait) {
-        await clientV2.session.promptAsync({
-          sessionID: sid,
-          parts: body.parts,
-          ...(model && { model }),
-          ...(opts.agent && { agent: opts.agent }),
-        });
-      } else {
-        await client.session.promptAsync({
-          path: { id: sid },
-          body,
-        });
-      }
+      await clientV2.session.promptAsync({
+        sessionID: sid,
+        parts: body.parts,
+        ...(model && { model }),
+        ...(opts.agent && { agent: opts.agent }),
+      });
       console.error("Prompt sent.");
 
       if (!opts.wait) {
@@ -415,6 +427,7 @@ export function worktreeRunCommand(): Command {
       try {
         turn = await waitForTurnComplete(client, sid, {
           priorAssistantIds,
+          timeoutMs,
           idleSince: idleTracker?.idleSince,
         });
       } catch (err) {
@@ -441,7 +454,8 @@ export function worktreeRunCommand(): Command {
       }
       if (turn.status === "timeout") {
         console.error(
-          `occtl wt run: timed out. Read the result with \`occtl last ${sid}\`.`
+          `occtl wt run: timed out after ${opts.timeout} second(s). ` +
+            `The session may still be running — read the result with \`occtl last ${sid}\`.`
         );
         process.exit(124);
       }
@@ -464,6 +478,15 @@ export function worktreeRunCommand(): Command {
       }
 
       const textOnly = opts.textOnly !== false;
-      console.log(formatMessage(last.info, last.parts, { textOnly }));
+      const formatted = formatMessage(last.info, last.parts, { textOnly });
+      if (formatted) {
+        console.log(formatted);
+      } else if (textOnly && !extractText(last.parts).trim()) {
+        console.error(
+          "No text in assistant response (tool-only or empty). " +
+            `Use -j/--json or \`occtl last ${sid}\` for full parts.`
+        );
+        process.exit(1);
+      }
     });
 }

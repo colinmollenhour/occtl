@@ -42,8 +42,9 @@ export function sessionSendCommand(): Command {
           process.exit(2);
         }
         const timeoutSeconds = Number(opts.timeout);
-        if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
-          console.error("--timeout must be a non-negative number of seconds.");
+        // Reject 0: waitForTurnComplete treats timeoutMs <= 0 as Infinity.
+        if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+          console.error("--timeout must be a positive number of seconds.");
           process.exit(2);
         }
         timeoutMs = timeoutSeconds * 1000;
