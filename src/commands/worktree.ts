@@ -2,11 +2,12 @@ import { Command } from "commander";
 import { execFileSync } from "child_process";
 import { existsSync } from "fs";
 import { resolve, basename } from "path";
-import { ensureServer } from "../client.js";
-import { formatJSON, formatMessage } from "../format.js";
+import type { Message } from "@opencode-ai/sdk";
+import { ensureServer, getClientV2 } from "../client.js";
+import { extractText, formatJSON, formatMessage } from "../format.js";
 import { getPermissionFromEvent, respondToPermission } from "../permission-util.js";
 import { startStream } from "../sse.js";
-import { waitForIdle } from "../wait-util.js";
+import { makeIdleTracker, snapshotAssistantIds, waitForTurnComplete } from "../turn-util.js";
 
 interface Worktree {
   path: string;
@@ -263,7 +264,12 @@ export function worktreeRunCommand(): Command {
     .option("--base <ref>", "Base ref to branch from (defaults to HEAD)")
     .option(
       "-w, --wait",
-      "Block until the session goes idle, then show the result"
+      "Block until this turn's assistant reply is finalized, then show it"
+    )
+    .option(
+      "--timeout <seconds>",
+      "With --wait: exit 124 if the turn has not finished after this many " +
+        "seconds. Read the result with `occtl last`."
     )
     .option("--auto-approve", "Auto-approve all permission requests")
     .option("--model <model>", "Model to use (format: provider/model)")
@@ -272,6 +278,20 @@ export function worktreeRunCommand(): Command {
     .option("-t, --text-only", "Show only text content")
     .option("--stdin", "Read message from stdin")
     .action(async (name: string, messageParts: string[], opts) => {
+      let timeoutMs = 0;
+      if (opts.timeout !== undefined) {
+        if (!opts.wait) {
+          console.error("--timeout requires --wait (-w).");
+          process.exit(2);
+        }
+        const timeoutSeconds = Number(opts.timeout);
+        if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+          console.error("--timeout must be a positive number of seconds.");
+          process.exit(2);
+        }
+        timeoutMs = timeoutSeconds * 1000;
+      }
+
       const client = await ensureServer();
 
       // Create the worktree
@@ -328,28 +348,60 @@ export function worktreeRunCommand(): Command {
         ...(opts.agent && { agent: opts.agent }),
       };
 
-      // Start auto-approve in background if requested.
-      // Uses startStream which returns a cancel handle.
+      // Auto-approve + idle tracking share one SSE stream when --wait is set so
+      // we do not open two event subscriptions for the same session.
+      const idleTracker = opts.wait ? makeIdleTracker() : undefined;
       let approveHandle: ReturnType<typeof startStream> | undefined;
-      if (opts.autoApprove) {
-        approveHandle = startStream(sid, async (event) => {
-          const permission = getPermissionFromEvent(event, sid);
-          if (!permission) return;
-          try {
-            await respondToPermission(sid, permission.id, "once");
-            console.error(`Auto-approved: ${permission.id}`);
-          } catch (err) {
-            console.error(
-              `Failed to auto-approve ${permission.id}: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        });
+      if (opts.autoApprove || opts.wait) {
+        approveHandle = startStream(
+          sid,
+          (event) => {
+            idleTracker?.observe(event);
+            if (!opts.autoApprove) return;
+            void (async () => {
+              const permission = getPermissionFromEvent(event, sid);
+              if (!permission) return;
+              try {
+                await respondToPermission(sid, permission.id, "once");
+                console.error(`Auto-approved: ${permission.id}`);
+              } catch (err) {
+                console.error(
+                  `Failed to auto-approve ${permission.id}: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`
+                );
+              }
+            })();
+          },
+          opts.wait ? { reconnect: true } : undefined
+        );
+        await approveHandle.connected;
       }
 
-      // Send the prompt
-      await client.session.promptAsync({
-        path: { id: sid },
-        body,
+      // Fresh session → empty snapshot; still snapshot so the wait cannot
+      // false-positive if the create path ever leaves prior messages.
+      let priorAssistantIds = new Set<string>();
+      if (opts.wait) {
+        try {
+          priorAssistantIds = await snapshotAssistantIds(client, sid);
+        } catch (err) {
+          approveHandle?.cancel();
+          console.error(
+            `occtl wt run: cannot snapshot session messages: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+          process.exit(1);
+        }
+      }
+
+      // Always use v2 promptAsync (same path as send/stream/run).
+      const clientV2 = getClientV2();
+      await clientV2.session.promptAsync({
+        sessionID: sid,
+        parts: body.parts,
+        ...(model && { model }),
+        ...(opts.agent && { agent: opts.agent }),
       });
       console.error("Prompt sent.");
 
@@ -365,37 +417,53 @@ export function worktreeRunCommand(): Command {
             return;
           }
         }
-        // Clean up auto-approve if not keeping it running
         approveHandle?.cancel();
         return;
       }
 
-      // --wait: use race-safe waitForIdle
-      const waitResult = await waitForIdle(client, sid, undefined, {
-        requireBusy: true,
-      });
-
-      // Clean up auto-approve
-      approveHandle?.cancel();
-
-      if (!waitResult.idle) {
-        if (waitResult.reason === "disconnected") {
-          console.error("Error: lost connection to OpenCode server.");
-        }
-        process.exit(1);
+      // --wait: same turn-completion model as send -w / stream / run
+      let turn: Awaited<ReturnType<typeof waitForTurnComplete>> | undefined;
+      let waitError: unknown;
+      try {
+        turn = await waitForTurnComplete(client, sid, {
+          priorAssistantIds,
+          timeoutMs,
+          idleSince: idleTracker?.idleSince,
+        });
+      } catch (err) {
+        waitError = err;
+      } finally {
+        approveHandle?.cancel();
       }
 
-      // Fetch the last assistant message
-      const msgs = await client.session.messages({
-        path: { id: sid },
-      });
-      const messages = msgs.data ?? [];
-      const last = messages.filter((m) => m.info.role === "assistant").pop();
-
-      if (!last) {
-        console.error("No assistant response.");
+      if (waitError) {
+        console.error(
+          `occtl wt run: ${
+            waitError instanceof Error ? waitError.message : String(waitError)
+          }`
+        );
         process.exit(1);
       }
+      if (!turn) {
+        console.error("occtl wt run: no turn result.");
+        process.exit(1);
+      }
+      if (turn.status === "disconnected") {
+        console.error("Error: lost connection to OpenCode server.");
+        process.exit(1);
+      }
+      if (turn.status === "timeout") {
+        console.error(
+          `occtl wt run: timed out after ${opts.timeout} second(s). ` +
+            `The session may still be running — read the result with \`occtl last ${sid}\`.`
+        );
+        process.exit(124);
+      }
+
+      const last = {
+        info: turn.message as unknown as Message,
+        parts: turn.parts,
+      };
 
       if (opts.json) {
         console.log(
@@ -410,6 +478,15 @@ export function worktreeRunCommand(): Command {
       }
 
       const textOnly = opts.textOnly !== false;
-      console.log(formatMessage(last.info, last.parts, { textOnly }));
+      const formatted = formatMessage(last.info, last.parts, { textOnly });
+      if (formatted) {
+        console.log(formatted);
+      } else if (textOnly && !extractText(last.parts).trim()) {
+        console.error(
+          "No text in assistant response (tool-only or empty). " +
+            `Use -j/--json or \`occtl last ${sid}\` for full parts.`
+        );
+        process.exit(1);
+      }
     });
 }

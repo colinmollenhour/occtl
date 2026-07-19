@@ -50,22 +50,34 @@ Aliases: `ls=list`, `new=create`, `rm=delete`, `show=get`, `msgs=messages`, `pro
 ## Send Work
 
 ```bash
-occtl send "prompt"                         # sync request, returns response
+occtl send "prompt"                         # sync SDK request (short turns)
 occtl prompt "prompt"                       # alias for send
 occtl send -s <id> "prompt"                 # target session
-occtl send --async -s <id> "prompt"         # fire and return
-occtl send -w -s <id> "prompt"              # send, wait idle, print reply
+occtl send --async -s <id> "prompt"         # fire and return (do not poll idle next)
+occtl send -w -s <id> "prompt"              # send, wait for THIS turn's reply, print it
+occtl send -w --timeout 600 -s <id> "prompt" # same; exit 124 on deadline, then `occtl last`
 occtl send --stdin -s <id> < prompt.md       # prompt from stdin
 occtl send --no-reply -s <id> "context"     # add context only
-occtl stream -s <id> "prompt"               # send + stream until idle
+occtl stream -s <id> "prompt"               # send + live stream until THIS turn finishes
 occtl stream --json -s <id> "prompt"        # NDJSON event stream
-occtl stream -s <id> "prompt" --timeout 600 # exit 124 if not idle in time, then `occtl last`
+occtl stream -s <id> "prompt" --timeout 600 # exit 124 if turn not done; then `occtl last`
 occtl stream -s <id> "prompt" --wait-children # also wait for sub-agent sessions
 ```
 
-`stream` exits 0 once the submitted turn finishes, detected by polling `session.messages` for a new finalized assistant message (`time.completed`/error) keyed off a pre-send snapshot — robust even when the server emits no `session.idle`/`session.status` SSE events, and it never exits pre-turn. SSE is used for best-effort live display and only accelerates the poll. `--timeout <seconds>` exits 124 if the turn has not finished; read the result with `occtl last`. Diagnostics go to stderr, keeping `--json` stdout valid NDJSON. By default it tracks only the main agent; add `--wait-children` for the tree-aware semantics (`wait-for-idle`/`is-idle` defaults) that also wait for sub-agents.
+### Which command to use
 
-Use `stream` or `send -w` for race-safe single-session automation. Parent sessions with active sub-agents report `waiting`; pass `--main-agent` to `status`, `wait-for-idle`, or `is-idle` only when parent-only status is intended. If using `send --async`, wait with `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
+| Goal | Prefer | Avoid |
+| --- | --- | --- |
+| Ask an existing session and need the answer (agents, consults, automation) | `stream` or `send -w` | `send --async` then `status`/`is-idle` without `--require-busy` |
+| Long / multi-tool turns where you want live progress | `stream` | default sync `send` (HTTP may time out) |
+| Short Q&A on a quiet session | default `send` or `send -w` | — |
+| Fire-and-forget, wait later with a barrier | `send --async` then `wait-for-idle --require-busy` or `wait-for-text` | bare `wait-for-idle` right after async |
+
+**Agent rule:** when consulting another OpenCode session, use `occtl stream --stdin -s <id> < prompt.md` (or `send -w --timeout <seconds>` if you only need the final text). Do **not** `send` without wait and immediately `status`/`last` — that races. Do **not** treat empty stdout + exit 0 as success without checking `last`.
+
+`send -w` and `stream` share the same completion model: snapshot assistant message IDs **before** send, then poll `session.messages` until a **new** assistant message is finalized (`time.completed` / terminal error / stable-content fallback). That never exits on pre-send idle and does not print a prior turn's message. Idle SSE is best-effort only (rescues abandoned turns). `--timeout <seconds>` exits 124; read the result with `occtl last`.
+
+`stream` additionally prints live text/tool events (NDJSON with `--json`). By default it tracks only the main agent; add `--wait-children` for tree-aware wait (same idea as `wait-for-idle` / `is-idle` defaults). Parent sessions with active sub-agents report `waiting`; pass `--main-agent` to `status`, `wait-for-idle`, or `is-idle` only when parent-only status is intended.
 
 Persist worker defaults at create time:
 
@@ -101,7 +113,7 @@ occtl is-idle <id> --require-busy
 occtl is-idle <id> --main-agent
 ```
 
-Race rule: new sessions may report idle before async prompt starts. After `send --async`, use `--require-busy`, `wait-for-text`, `send -w`, or `stream`.
+Race rule: session status can report idle before an async prompt starts, and some servers omit status maps while a turn is running. Never chain `send --async` → bare `wait-for-idle` / `is-idle`. Prefer `stream` or `send -w` (turn-complete). If you must separate send and wait, use `wait-for-idle --require-busy`, `wait-all --require-busy`, or `wait-for-text`.
 
 Permission rule: `occtl respond --wait` handles requests that were already pending before the command started, then watches for new requests. Use `--auto-approve --wait` only when approving every request with `once` is acceptable for that session and repository.
 
