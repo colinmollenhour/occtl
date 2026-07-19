@@ -72,34 +72,42 @@ Commands that take a session ID usually accept a full ID, partial ID, title subs
 ### Send work
 
 ```bash
-occtl send "fix the failing tests"              # send and wait for the response
+occtl send "fix the failing tests"              # sync SDK send (short turns)
 occtl send --async "run the test suite"         # send and return immediately
-occtl send --wait "update the docs"             # send, wait until idle, and print the reply
+occtl send --wait "update the docs"             # send, wait for THIS turn's reply, print it
+occtl send -w --timeout 600 "long consult"      # same; exit 124 on deadline → `occtl last`
 occtl send --stdin < prompt.md                  # read the prompt from stdin
-occtl stream "implement the parser"             # stream tool calls and text until idle
+occtl stream "implement the parser"             # stream tool calls and text until the turn finishes
 occtl stream --json "run verification"          # newline-delimited JSON events
-occtl stream "long task" --timeout 1800         # exit 124 if not idle in 1800s, then `occtl last`
+occtl stream "long task" --timeout 1800         # exit 124 if turn not done in 1800s, then `occtl last`
 occtl stream "spawn sub-agents" --wait-children # also wait for sub-agents to finish
 ```
 
-`stream` exits 0 once the turn it submitted has finished. It detects completion
-by polling `session.messages` for a **new** assistant message that the server has
-finalized (`time.completed`, or a terminal error), keyed off a snapshot taken
-before the prompt is sent. This is robust regardless of whether the server emits
-`session.idle`/`session.status` SSE events (some versions emit none): a fresh or
-idle session can never look "already done" (no new message exists yet), and a
-missed terminal event can never wedge the command. The live SSE stream is still
-used for best-effort display and only *accelerates* the poll. `--timeout
-<seconds>` exits 124 if the turn has not finished by the deadline; read the
-result with `occtl last`. Diagnostics always go to stderr, so `--json` stdout
-stays valid NDJSON.
+`send --wait` and `stream` share the same turn-completion model: they snapshot
+assistant message IDs **before** sending, then poll `session.messages` until a
+**new** assistant message is finalized (`time.completed`, terminal error, or a
+stable-content fallback). That is robust even when the server emits no
+`session.idle`/`session.status` SSE events or reports empty status maps: a
+fresh or idle session can never look "already done", a prior turn's message is
+never printed as the reply, and a missed terminal SSE event cannot wedge the
+command. Idle SSE is best-effort only (live display for `stream`; abandoned-turn
+rescue for both). `--timeout <seconds>` exits 124; read the result with
+`occtl last`. Diagnostics go to stderr so `--json` stdout stays clean.
+
+Prefer `stream` when you want live progress; prefer `send -w` when you only need
+the final text. Default (sync) `send` is fine for short turns but can hit HTTP
+timeouts on long agentic work. If you use `send --async` and then poll, pass
+`--require-busy` to `wait-for-idle`, `wait-all`, or `is-idle` — bare idle checks
+race with async start and flaky status maps.
 
 By default `stream` tracks only the main agent (its own behavior, and the
 cheapest poll). Pass `--wait-children` to stay until sub-agent (child) sessions
 are idle too — the tree-aware semantics that `wait-for-idle` and `is-idle` use by
 default. This adds a session-tree lookup to each poll, so it is opt-in.
 
-Use `stream` or `send --wait` for single-session automation. `status`, `summary`, `list --active`, `wait-for-idle`, and `is-idle` treat a parent session with active sub-agents as `waiting`, not idle. Pass `--main-agent` when you specifically want the parent agent's own status. If you use `send --async` and then poll, pass `--require-busy` to `wait-for-idle`, `wait-all`, or `is-idle` so a fresh session does not appear idle before the prompt starts.
+`status`, `summary`, `list --active`, `wait-for-idle`, and `is-idle` treat a
+parent session with active sub-agents as `waiting`, not idle. Pass `--main-agent`
+when you specifically want the parent agent's own status.
 
 ### Wait for completion
 
@@ -275,8 +283,8 @@ When `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, or `https_proxy` is set, occtl r
 | `last` | Print the last message, usually as text. |
 | `status` | Show idle, waiting, busy, and retry status. |
 | `watch` | Watch real-time session events. |
-| `send`, `prompt` | Send a message to a session. |
-| `stream` | Send a message and stream events until the session becomes idle. `--timeout <s>` exits 124; `--wait-children` also waits for sub-agents. |
+| `send`, `prompt` | Send a message to a session. `--wait` / `-w` waits for **this** turn's finalized reply (same completion model as `stream`/`run`); `--timeout <s>` with `-w` exits 124. |
+| `stream` | Send a message and stream events until **this** turn finishes. `--timeout <s>` exits 124; `--wait-children` also waits for sub-agents. |
 | `run` | Run a one-shot prompt in a new session. |
 | `respond` | Respond to permission requests. |
 | `models` | List providers, models, and variants from OpenCode configuration. |
@@ -320,9 +328,10 @@ The supervisory agent can use:
 
 ```bash
 occtl wait-for-idle ses_abc123
-occtl send -w -s ses_abc123 "create a pull request for this work"
+occtl stream -s ses_abc123 "create a pull request for this work"
+# or: occtl send -w --timeout 600 -s ses_abc123 "create a pull request for this work"
 occtl last ses_abc123
-occtl send -w -s ses_abc123 "CI failed with this log. Fix it: ..."
+occtl send -w --timeout 600 -s ses_abc123 "CI failed with this log. Fix it: ..."
 ```
 
 ### Review another session
